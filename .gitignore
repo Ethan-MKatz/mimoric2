@@ -1,0 +1,45 @@
+# vim swp
+*.swp
+
+# log and exec file
+cmake_targets/log/
+cmake_targets/*/build/
+cmake_targets/ran_build/
+cmake_targets/nas_sim_tools/build/
+logs/
+lte_build_oai/
+channel/
+
+# IDE files
+.vscode
+.cproject
+.project
+.settings
+
+# Tags for vim/global
+GPATH
+GRTAGS
+GTAGS
+tags
+
+# others
+nfapi_nr_interface_scf
+*.log
+*.out
+CMakeUserPresets.json
+
+# Python bytecode
+__pycache__/
+*.pyc
+
+# Python virtualenvs
+.venv/
+venv/
+
+# Experiment plot output
+sims/siso/tti_experiments/plot*/
+
+# Runtime logs
+logs/
+logs_gnb/
+logs_ue/
