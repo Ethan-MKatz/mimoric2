@@ -25,6 +25,8 @@
 #include <time.h>
 #include <stdio.h>
 #include <complex.h>
+#include <string.h>
+#include <stdbool.h>
 #include <common/utils/LOG/log.h>
 #include <openair1/SIMULATION/TOOLS/sim.h>
 #include "rfsimulator.h"
@@ -45,6 +47,11 @@ extern FILE *fpi_jam[50]; // jammer taps, imag part
 extern int jam_enable;    // 0/1 from --JAM
 extern double jam_gain;   // linear output gain from --JGAIN
 extern int jamtaplen;     // number of jammer taps from --JTAP (default 64)
+
+/* Max taps the per-socket H cache holds per rx row (nb_tx*taplen), and the read
+   buffer that must fit that many scientific-notation fields on one line. */
+#define _MIMO_MAXTAPS 1024
+#define _MIMO_MAXLINE (_MIMO_MAXTAPS * 20)
 //extern int counterr;
  //int counter=0;
 //  FILE *fpr;
@@ -73,6 +80,31 @@ extern int jamtaplen;     // number of jammer taps from --JTAP (default 64)
   either we regenerate the channel (call again random_channel(desc,0)), or we keep it over subframes
   legacy: we regenerate each sub frame in UL, and each frame only in DL
 */
+/* Read one tap line, rewinding at EOF so the channel file loops.
+   Tap lines are wide: nb_tx*taplen fields in scientific notation (a 4x4 @ 64 taps
+   line is ~4.2 kB), so the caller's buffer must hold a whole line. A short buffer
+   silently splits one line across successive reads and de-syncs the rx rows, so
+   warn once and drop the remainder of the line instead. */
+static bool readTapLine(FILE *f, char *buf, size_t bufSize)
+{
+  if (fgets(buf, bufSize, f) == NULL) {
+    rewind(f);
+    if (fgets(buf, bufSize, f) == NULL)
+      return false;
+  }
+  if (strchr(buf, '\n') == NULL && !feof(f)) {
+    static bool warned = false;
+    if (!warned) {
+      warned = true;
+      LOG_E(HW, "channel tap line exceeds the %zu-byte read buffer; taps are being truncated\n", bufSize);
+    }
+    int c;
+    while ((c = fgetc(f)) != EOF && c != '\n')
+      ;
+  }
+  return true;
+}
+
 void rxAddInput(const c16_t *input_sig,
                 c16_t *after_channel_sig,
                 int rxAnt,
@@ -80,10 +112,11 @@ void rxAddInput(const c16_t *input_sig,
                 int nbSamples,
                 uint64_t TS,
                 uint32_t CirSize,
-                uint32_t sock_num)
+                uint32_t sock_num,
+                int nbTxStream)
 {
   
-  char strr[2000],stri[2000];
+  char strr[_MIMO_MAXLINE], stri[_MIMO_MAXLINE];
   static int line_count = 0;  
  
   //fgets(strr, sizeof(strr), fpr);
@@ -169,7 +202,11 @@ void rxAddInput(const c16_t *input_sig,
   // the normalized OAI value seems to be 256 as average amplitude (numerical amplification = 1)
   const double noise_per_sample = pow(10,channelDesc->noise_power_dB/10.0) * 256;
   const uint64_t dd = channelDesc->channel_offset;
-  const int nbTx=channelDesc->nb_tx;
+  // The circular buffer is interleaved by the SENDER's antenna count, and the channel has
+  // one tx column per transmitted stream. channelDesc->nb_tx is this node's own tx antenna
+  // count, which is not the same thing (a 1-tx gNB talking to a 4-tx UE differs), so using it
+  // as the stride reads the buffer scrambled. Trust the stream count from the packet header.
+  const int nbTx = (nbTxStream > 0) ? nbTxStream : channelDesc->nb_tx;
    // counterr++;
   // int mylen=1;
   // --- MIMO channel matrix, cached per receive cycle (fixes the nb_rx>1 de-sync) ------
@@ -179,8 +216,8 @@ void rxAddInput(const c16_t *input_sig,
   //   [txAnt*taplen + l]; nb_tx*taplen must be <= 1024.
   #define _MIMO_MAXSOCK 8
   #define _MIMO_MAXRX   8
-  static float Hr_cache[_MIMO_MAXSOCK][_MIMO_MAXRX][8*128];
-  static float Hi_cache[_MIMO_MAXSOCK][_MIMO_MAXRX][8*128];
+  static float Hr_cache[_MIMO_MAXSOCK][_MIMO_MAXRX][_MIMO_MAXTAPS];
+  static float Hi_cache[_MIMO_MAXSOCK][_MIMO_MAXRX][_MIMO_MAXTAPS];
   const int nbRx = channelDesc->nb_rx;
   int si = (int)sock_num - first_time;
   if (si < 0) si = 0;
@@ -201,20 +238,33 @@ void rxAddInput(const c16_t *input_sig,
 
     // Load the full nb_rx x nb_tx channel matrix ONCE per cycle (on the rxAnt==0 call);
     // one file line per rx antenna. Other rx antennas reuse the cache via the row pointers.
-    if (rxAnt == 0) {
+    if (rxAnt == 0 && fpr[si] != NULL && fpi[si] != NULL) {
       for (int r = 0; r < nbRx && r < _MIMO_MAXRX; r++) {
-        if (fgets(strr, sizeof(strr), fpr[si]) == NULL) { rewind(fpr[si]); if (fgets(strr, sizeof(strr), fpr[si]) == NULL) break; }
+        if (!readTapLine(fpr[si], strr, sizeof(strr))) break;
         char *tk = strtok(strr, " ");
         int k = 0;
-        for (; tk != NULL && k < nbTx*taplen && k < 8*128; k++) { Hr_cache[si][r][k] = atof(tk); tk = strtok(NULL, " "); }
-        for (; k < 8*128; k++) Hr_cache[si][r][k] = 0.0f;
-        if (fgets(stri, sizeof(stri), fpi[si]) == NULL) { rewind(fpi[si]); if (fgets(stri, sizeof(stri), fpi[si]) == NULL) break; }
+        for (; tk != NULL && k < nbTx*taplen && k < _MIMO_MAXTAPS; k++) { Hr_cache[si][r][k] = atof(tk); tk = strtok(NULL, " "); }
+        for (; k < _MIMO_MAXTAPS; k++) Hr_cache[si][r][k] = 0.0f;
+        if (!readTapLine(fpi[si], stri, sizeof(stri))) break;
         tk = strtok(stri, " ");
         k = 0;
-        for (; tk != NULL && k < nbTx*taplen && k < 8*128; k++) { Hi_cache[si][r][k] = atof(tk); tk = strtok(NULL, " "); }
-        for (; k < 8*128; k++) Hi_cache[si][r][k] = 0.0f;
+        for (; tk != NULL && k < nbTx*taplen && k < _MIMO_MAXTAPS; k++) { Hi_cache[si][r][k] = atof(tk); tk = strtok(NULL, " "); }
+        for (; k < _MIMO_MAXTAPS; k++) Hi_cache[si][r][k] = 0.0f;
       }
       line_count += nbRx;
+      { // one-shot diagnostic: what is the replay actually applying?
+        static int diag = 0;
+        if (!diag) {
+          diag = 1;
+          fprintf(stderr, "[REPLAY-DIAG] taplen=%d nbTx=%d nbRx=%d pathloss_dB=%f noise_dB=%f dd=%lu CirSize=%u\n",
+                  taplen, nbTx, nbRx, channelDesc->path_loss_dB, channelDesc->noise_power_dB,
+                  (unsigned long)dd, CirSize);
+          fprintf(stderr, "[REPLAY-DIAG] H[0][tx*taplen+0] =");
+          for (int tx = 0; tx < nbTx; tx++)
+            fprintf(stderr, " %g", Hr_cache[si][0][tx*taplen+0]);
+          fprintf(stderr, "\n");
+        }
+      }
       if (line_count % 1000 < nbRx) printf("TTI %llu: MIMO channel rows loaded, sock %u\n", TS, sock_num);
     }
 

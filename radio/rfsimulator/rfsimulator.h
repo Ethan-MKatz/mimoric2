@@ -30,7 +30,8 @@ void rxAddInput( const c16_t *input_sig,
                  int nbSamples,
                  uint64_t TS,
                  uint32_t CirSize,
-                 uint32_t sock_num
+                 uint32_t sock_num,
+                 int nbTxStream   // sender's antenna count: the circular buffer's interleave stride
                );
 
 void txAddInput(const c16_t *input_sig,

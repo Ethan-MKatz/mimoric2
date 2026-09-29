@@ -39,6 +39,16 @@
 #include "LAYER2/RLC/rlc.h"
 #include "./../../../executables/edgeric/wrapper.h"
 
+// ---- TinyTwin: 4x4 uplink channel, exported from SRS -----------------------
+// PUSCH DMRS is per-layer and UL rank is 1, so it can only give H[rx] (4x1).
+// SRS is sounded per UE antenna port, so the codebook report below carries the
+// full H[gNB antenna][UE port][PRG] -- the only 4x4 uplink matrix in the stack.
+// Opened in nr-softmodem.c from TT_UL_SRS_LOG. Written in the same text format
+// as the UE's dl_csi_ue1.txt so the downlink alignment tooling reads it as-is.
+FILE *fpulsrs = NULL;
+int tt_srs_every = 1;    // SRS period ~ CSI-RS cadence (n_slots_period*16); keep all by default
+int tt_srs_max = 2000;   // record cap, bounds the file (TT_UL_SRS_MAX)
+
 // #define SRS_IND_DEBUG
 
 extern int tptlog;
@@ -1464,6 +1474,44 @@ void handle_nr_srs_measurements(const module_id_t module_id,
         }
       }
 #endif
+
+      // ---- TinyTwin: dump the SRS channel matrix -----------------------------
+      // Written as [rx = gNB antenna][tx = UE port][sc = PRG], matching the DL
+      // CSI-RS dump's [rx][tx][sc], so rx/tx mean "receiving/transmitting side"
+      // in both files. Source layout (nfapi_nr_interface_scf.h):
+      //   channel_matrix[uI*Ng*Np + gI*Np + pI]
+      {
+        static unsigned long tt_srs_seen = 0;
+        static int tt_srs_written = 0;
+        const int Ng = nr_srs_channel_iq_matrix.num_gnb_antenna_elements;
+        const int Nu = nr_srs_channel_iq_matrix.num_ue_srs_ports;
+        const int Np = nr_srs_channel_iq_matrix.num_prgs;
+        const int iq16 = nr_srs_channel_iq_matrix.normalized_iq_representation;
+        if ((tt_srs_seen % 200) == 0)
+          LOG_I(NR_MAC, "TT-SRS: report %lu  gNB_ant %d  UE_ports %d  PRGs %d (prg_size %d)  iq16 %d  written %d\n",
+                tt_srs_seen, Ng, Nu, Np, nr_srs_channel_iq_matrix.prg_size, iq16, tt_srs_written);
+        if (fpulsrs && Ng > 0 && Nu > 0 && Np > 0
+            && (tt_srs_seen % tt_srs_every) == 0 && tt_srs_written < tt_srs_max) {
+          const c16_t *m16 = (const c16_t *)nr_srs_channel_iq_matrix.channel_matrix;
+          const c8_t *m8 = (const c8_t *)nr_srs_channel_iq_matrix.channel_matrix;
+          fprintf(fpulsrs, "SRS %d %d %d %d %d %d", tt_srs_written, frame, slot, Ng, Nu, Np);
+          for (int gI = 0; gI < Ng; gI++)
+            for (int uI = 0; uI < Nu; uI++)
+              for (int pI = 0; pI < Np; pI++) {
+                const int idx = uI * Ng * Np + gI * Np + pI;
+                if (iq16)
+                  fprintf(fpulsrs, " %d %d", m16[idx].r, m16[idx].i);
+                else
+                  fprintf(fpulsrs, " %d %d", m8[idx].r, m8[idx].i);
+              }
+          fprintf(fpulsrs, "\n");
+          fflush(fpulsrs);
+          tt_srs_written++;
+          if (tt_srs_written == tt_srs_max)
+            LOG_I(NR_MAC, "TT-SRS: reached TT_UL_SRS_MAX=%d records, stopping dump\n", tt_srs_max);
+        }
+        tt_srs_seen++;
+      }
 
       NR_UE_sched_ctrl_t *sched_ctrl = &UE->UE_sched_ctrl;
       NR_UE_UL_BWP_t *current_BWP = &UE->current_UL_BWP;

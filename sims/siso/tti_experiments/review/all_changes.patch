@@ -1,0 +1,1127 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 6a3f707..f6a8b8e 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -2093,7 +2093,7 @@ target_link_libraries(nr-uesoftmodem PRIVATE
+   PHY_COMMON PHY_NR_COMMON PHY_NR_UE NR_L2_UE L2_UE_LTE_NR MAC_NR_COMMON NFAPI_LIB NFAPI_PNF_LIB
+   NFAPI_USER_LIB MISC_NFAPI_NR_LIB
+   ITTI LIB_5GNAS_GNB LIB_NAS_SIMUE ${NAS_SIM_LIB} SIMU shlib_loader
+-  -Wl,--end-group z dl)
++  -Wl,--end-group z dl zmq)   # zmq: TinyTwin DL CSI publisher (csi_rx.c)
+ 
+ target_link_libraries(nr-uesoftmodem PRIVATE pthread m CONFIG_LIB rt nr_ue_phy_meas)
+ target_link_libraries(nr-uesoftmodem PRIVATE ${T_LIB})
+diff --git a/ci-scripts/conf_files/nrue.uicc.conf b/ci-scripts/conf_files/nrue.uicc.conf
+index 27982d7..f42b7d9 100644
+--- a/ci-scripts/conf_files/nrue.uicc.conf
++++ b/ci-scripts/conf_files/nrue.uicc.conf
+@@ -16,8 +16,8 @@ channelmod = {
+     { # DL, modify on UE side
+       model_name     = "rfsimu_channel_enB0"
+       type           = "AWGN";
+-      ploss_dB       = 20;
+-      noise_power_dB = -4;
++      ploss_dB       = 0;
++      noise_power_dB = -20;
+       forgetfact     = 0;
+       offset         = 0;
+       ds_tdl         = 0;
+diff --git a/common/config/config_load_configmodule.c b/common/config/config_load_configmodule.c
+index c4e1c01..d165016 100644
+--- a/common/config/config_load_configmodule.c
++++ b/common/config/config_load_configmodule.c
+@@ -61,6 +61,12 @@ int taplen;
+ int jam_enable = 0;      // --JAM  <0/1>   : turn the jammer on/off
+ double jam_gain = 1.0;   // --JGAIN <float>: linear gain applied to the jammer output
+ int jamtaplen = 64;      // --JTAP <n>     : number of jammer taps per TTI
++// --- uplink channel replay ---
++// The UE always replays the channel on its receive path (DL). The gNB normally applies
++// nothing and rfsim falls back to its hardcoded H_awgn_mimo placeholder, so the UL carries
++// no replayed channel at all. --ULCHAN 1 lets the gNB run the same MIMO replay on its
++// receive path, which is what makes the UL H visible to the MIMO-RIC channel export.
++int ul_chan_enable = 0;  // --ULCHAN <0/1>
+ int snrlog = 0;
+ int cqilog = 0;
+ int tptlog = 0;
+@@ -266,6 +272,7 @@ configmodule_interface_t *load_configmodule(int argc,
+   int JAMIdx=-1;
+   int JGAINIdx=-1;
+   int JTAPIdx=-1;
++  int ULCHANIdx=-1;
+   int OWoptIdx = -1;
+ 
+   printf("CMDLINE: ");
+@@ -312,6 +319,11 @@ configmodule_interface_t *load_configmodule(int argc,
+       jamtaplen = argv[i + 1] ? atoi(argv[i + 1]) : 64;
+       JTAPIdx = i;
+     }
++    char *ULCHANopt = strstr(argv[i], "ULCHAN");
++    if (ULCHANopt == argv[i] + 2) {
++      ul_chan_enable = argv[i + 1] ? atoi(argv[i + 1]) : 0;
++      ULCHANIdx = i;
++    }
+ 
+     // if (strcmp(&argv[i][1], "SNR") == 0 && i < (argc - 1)) {
+     //     snrlog = atoi(argv[i + 1]);
+@@ -487,6 +499,10 @@ configmodule_interface_t *load_configmodule(int argc,
+       cfgptr->argv_info[JTAPIdx] |= CONFIG_CMDLINEOPT_PROCESSED;
+       cfgptr->argv_info[JTAPIdx+1] |= CONFIG_CMDLINEOPT_PROCESSED;
+     }
++    if (ULCHANIdx >= 0) {
++      cfgptr->argv_info[ULCHANIdx] |= CONFIG_CMDLINEOPT_PROCESSED;
++      cfgptr->argv_info[ULCHANIdx+1] |= CONFIG_CMDLINEOPT_PROCESSED;
++    }
+ 
+     cfgptr->rtflags = cfgptr->rtflags | tmpflags;
+     cfgptr->argc   = argc;
+diff --git a/executables/nr-softmodem.c b/executables/nr-softmodem.c
+index 13a5f96..900bb0a 100644
+--- a/executables/nr-softmodem.c
++++ b/executables/nr-softmodem.c
+@@ -113,6 +113,9 @@ extern FILE *fpdlmcs;
+ extern FILE *fpretx;
+ extern const char *channel_file;
+ extern int gnb1_ue0;
++extern FILE *fpulsrs;      // 4x4 UL SRS matrix dump (gNB_scheduler_ulsch.c)
++extern int tt_srs_every;
++extern int tt_srs_max;
+ 
+ extern long long unsigned int timing_array[_ARRAY_SIZE];
+ extern int timing_array_index;
+@@ -664,9 +667,41 @@ int main( int argc, char **argv ) {
+   // METAL VERSIONS //
+   // fpr = fopen("../../../channel/real_random_10tap.txt", "r");
+   // fpi = fopen("../../../channel/real_random_10tap.txt", "r");
+-  for (int i=0;i<50;i++){
+-    fpr[i] = fopen("../../../channel/signal_metal_real.txt", "r");
+-    fpi[i] = fopen("../../../channel/signal_metal_imag.txt", "r");
++  // Tap set for the UL replay (--ULCHAN 1). TT_UL_CHAN_SIGNAL picks the file stem under
++  // channel/ so a material swap needs no rebuild; the default keeps the previous behaviour.
++  // Handle count is unchanged on purpose -- see the fd note below.
++  {
++    const char *ulStem = getenv("TT_UL_CHAN_SIGNAL") ? getenv("TT_UL_CHAN_SIGNAL") : "signal_metal";
++    char pr[512], pi[512];
++    snprintf(pr, sizeof(pr), "../../../channel/%s_real.txt", ulStem);
++    snprintf(pi, sizeof(pi), "../../../channel/%s_imag.txt", ulStem);
++    for (int i = 0; i < 50; i++) {
++      fpr[i] = fopen(pr, "r");
++      fpi[i] = fopen(pi, "r");
++    }
++    // NOTE: plain stderr, not LOG_*: logInit() has not run yet at this point in main().
++    if (fpr[0] == NULL || fpi[0] == NULL)
++      fprintf(stderr, "[UL channel replay] cannot open %s / %s\n", pr, pi);
++    else
++      fprintf(stderr, "[UL channel replay] tap set '%s' (enable with --ULCHAN 1)\n", ulStem);
++  }
++
++  // 4x4 uplink channel from SRS, opt-in via TT_UL_SRS_LOG (a file path).
++  // DMRS cannot give 4x4 at UL rank 1; SRS is sounded per UE antenna port.
++  // NOTE: plain stderr -- logInit() has not run yet at this point in main().
++  {
++    const char *srsLog = getenv("TT_UL_SRS_LOG");
++    if (srsLog && srsLog[0]) {
++      if (getenv("TT_UL_SRS_EVERY") && atoi(getenv("TT_UL_SRS_EVERY")) > 0)
++        tt_srs_every = atoi(getenv("TT_UL_SRS_EVERY"));
++      if (getenv("TT_UL_SRS_MAX") && atoi(getenv("TT_UL_SRS_MAX")) > 0)
++        tt_srs_max = atoi(getenv("TT_UL_SRS_MAX"));
++      fpulsrs = fopen(srsLog, "w");
++      if (fpulsrs == NULL)
++        fprintf(stderr, "[UL SRS dump] cannot open %s\n", srsLog);
++      else
++        fprintf(stderr, "[UL SRS dump] %s (every %d, max %d)\n", srsLog, tt_srs_every, tt_srs_max);
++    }
+   }
+   // NOTE: the gNB never applies the channel/jammer (gnb1_ue0==1), so we do NOT open
+   // jammer files here — 100 extra fds would push the rfsim socket fd past MAX_FD_RFSIMU
+diff --git a/executables/nr-uesoftmodem.c b/executables/nr-uesoftmodem.c
+index e197fe8..cdb83b9 100644
+--- a/executables/nr-uesoftmodem.c
++++ b/executables/nr-uesoftmodem.c
+@@ -27,6 +27,7 @@
+ #include <stdbool.h>
+ #include <signal.h>
+ #include <stdio.h>
++#include <zmq.h>
+ 
+ #include "T.h"
+ #include "common/oai_version.h"
+@@ -95,6 +96,11 @@ unsigned short config_frames[4] = {2,9,11,13};
+ extern FILE *fpr[50];
+ extern FILE *fpi[50];
+ extern FILE *fprsrp;
++extern FILE *fpdlcsi;   // complex 4x4 CSI-RS dump (csi_rx.c)
++extern void *tt_csi_zmq_ctx;
++extern void *tt_csi_zmq_pub;
++extern int tt_csi_every;
++extern int tt_csi_max;
+ extern FILE *fpcqi;
+ extern FILE *fplog; 
+ extern FILE *fplog2;
+@@ -113,6 +119,20 @@ FILE *fpr[50];
+ FILE *fpi[50];
+ FILE *fpr_jam[50];
+ FILE *fpi_jam[50];
++extern FILE *fpdlch;   // per-rx-antenna DL channel power log
++
++/* Open one channel tap file under channel/, by stem and "real"/"imag" part.
++   Returns NULL and logs if it is missing, so a bad path shows up here rather
++   than as a crash in the replay loop. */
++static FILE *openTapFile(const char *stem, const char *part)
++{
++  char path[512];
++  snprintf(path, sizeof(path), "../../../channel/%s_%s.txt", stem, part);
++  FILE *f = fopen(path, "r");
++  if (f == NULL)
++    LOG_E(HW, "channel replay: cannot open %s\n", path);
++  return f;
++}
+ FILE *fpcqi;
+ FILE *fprsrp;
+ FILE *fplog;
+@@ -285,17 +305,72 @@ void init_openair0()
+   // fpr = fopen("../../../channel/real_random_10tap.txt", "r");
+   // fpi = fopen("../../../channel/real_random_10tap.txt", "r");
+ 
+-  fpr[0] = fopen("../../../channel/signal_metal_4x4_real.txt", "r");
+-  fpi[0] = fopen("../../../channel/signal_metal_4x4_imag.txt", "r");
++  // Which tap set to replay is chosen at run time so an A/B (e.g. concrete vs
++  // metal) needs no rebuild: set TT_CHAN_SIGNAL / TT_CHAN_JAMMER to the file
++  // stem under channel/, minus the _real.txt / _imag.txt suffix.
++  const char *sigStem = getenv("TT_CHAN_SIGNAL") ? getenv("TT_CHAN_SIGNAL") : "signal_metal_4x4";
++  const char *jamStem = getenv("TT_CHAN_JAMMER") ? getenv("TT_CHAN_JAMMER") : "jammer_metal_4x4";
++
++  for (int s = 0; s < 2; s++) {
++    fpr[s] = openTapFile(sigStem, "real");
++    fpi[s] = openTapFile(sigStem, "imag");
++    fpr_jam[s] = openTapFile(jamStem, "real");
++    fpi_jam[s] = openTapFile(jamStem, "imag");
++  }
++  LOG_I(HW, "channel replay: signal='%s' jammer='%s'\n", sigStem, jamStem);
++
++  // Per-rx-antenna DL channel power, written from the SSB channel estimate.
++  // TT_DL_CHAN_LOG overrides the path; default lands beside the other logs.
++  {
++    const char *dlLog = getenv("TT_DL_CHAN_LOG") ? getenv("TT_DL_CHAN_LOG") : "../../../logs/dl_channel.txt";
++    fpdlch = fopen(dlLog, "w");
++    if (fpdlch == NULL)
++      LOG_E(HW, "DL channel log: cannot open %s\n", dlLog);
++    else
++      LOG_I(HW, "DL channel log: %s\n", dlLog);
++  }
+ 
+-  fpr[1] = fopen("../../../channel/signal_metal_4x4_real.txt", "r");
+-  fpi[1] = fopen("../../../channel/signal_metal_4x4_imag.txt", "r");
++  // Complex 4x4 CSI-RS channel dump, opt-in: TT_DL_CSI_LOG names the file.
++  // This is what the host-side validate_mimo.py needs -- dl_channel.txt carries
++  // power only, which cannot show phase ramp, AoA or singular-value structure.
++  {
++    const char *csiLog = getenv("TT_DL_CSI_LOG");
++    if (csiLog && csiLog[0]) {
++      if (getenv("TT_DL_CSI_EVERY") && atoi(getenv("TT_DL_CSI_EVERY")) > 0)
++        tt_csi_every = atoi(getenv("TT_DL_CSI_EVERY"));
++      if (getenv("TT_DL_CSI_MAX") && atoi(getenv("TT_DL_CSI_MAX")) > 0)
++        tt_csi_max = atoi(getenv("TT_DL_CSI_MAX"));
++      fpdlcsi = fopen(csiLog, "w");
++      if (fpdlcsi == NULL)
++        LOG_E(HW, "DL CSI dump: cannot open %s\n", csiLog);
++      else
++        LOG_I(HW, "DL CSI dump: %s (every %d, max %d)\n", csiLog, tt_csi_every, tt_csi_max);
++    }
++  }
+ 
+-  // jammer channel taps (real + imag) — replayed alongside the signal channel
+-  fpr_jam[0] = fopen("../../../channel/jammer_metal_4x4_real.txt", "r");
+-  fpi_jam[0] = fopen("../../../channel/jammer_metal_4x4_imag.txt", "r");
+-  fpr_jam[1] = fopen("../../../channel/jammer_metal_4x4_real.txt", "r");
+-  fpi_jam[1] = fopen("../../../channel/jammer_metal_4x4_imag.txt", "r");
++  // Downlink CSI over ZMQ, for an xApp that needs the REPLAYED channel.
++  // The gNB's MIMO-RIC export is uplink-only; this is the downlink equivalent.
++  // TT_DL_CSI_ZMQ is a bind endpoint, e.g. tcp://0.0.0.0:5558
++  {
++    const char *ep = getenv("TT_DL_CSI_ZMQ");
++    if (ep && ep[0]) {
++      tt_csi_zmq_ctx = zmq_ctx_new();
++      tt_csi_zmq_pub = tt_csi_zmq_ctx ? zmq_socket(tt_csi_zmq_ctx, ZMQ_PUB) : NULL;
++      if (tt_csi_zmq_pub) {
++        int sndhwm = 8;   // shallow queue: a slow subscriber must never stall the PHY
++        zmq_setsockopt(tt_csi_zmq_pub, ZMQ_SNDHWM, &sndhwm, sizeof(sndhwm));
++        int linger = 0;
++        zmq_setsockopt(tt_csi_zmq_pub, ZMQ_LINGER, &linger, sizeof(linger));
++        if (zmq_bind(tt_csi_zmq_pub, ep) != 0) {
++          LOG_E(HW, "DL CSI ZMQ: cannot bind %s (%s)\n", ep, zmq_strerror(zmq_errno()));
++          zmq_close(tt_csi_zmq_pub);
++          tt_csi_zmq_pub = NULL;
++        } else {
++          LOG_I(HW, "DL CSI ZMQ: publishing on %s\n", ep);
++        }
++      }
++    }
++  }
+ 
+   // if (snrlog){
+     // fpsnr = fopen("../../../logs/snr.txt", "w"); // file the SNR is written to
+diff --git a/openair1/PHY/NR_TRANSPORT/nr_ulsch_demodulation.c b/openair1/PHY/NR_TRANSPORT/nr_ulsch_demodulation.c
+index b1b9f81..1796aa4 100644
+--- a/openair1/PHY/NR_TRANSPORT/nr_ulsch_demodulation.c
++++ b/openair1/PHY/NR_TRANSPORT/nr_ulsch_demodulation.c
+@@ -1676,7 +1676,11 @@ int nr_rx_pusch_tp(PHY_VARS_gNB *gNB,
+         c16_t *che = (c16_t *)ul_ch_estimates_ext[0 * nrx + aarx];
+         int base = meas_symbol * nb_re_pusch;
+         int cnt = 0;
+-        for (int re = 0; re < buffer_length && (idx + 2) <= (int)(sizeof(chbuf)/sizeof(float)); re += DS_SC) {
++        // Bound by nb_re_pusch, not buffer_length: only nb_re_pusch REs were written for
++        // this symbol (on the DMRS symbol get_nb_re_pusch is half the allocation width), so
++        // walking to buffer_length reads the next symbol's unwritten block as zeros -- and
++        // for a late meas_symbol runs past the end of the row entirely.
++        for (int re = 0; re < nb_re_pusch && (idx + 2) <= (int)(sizeof(chbuf)/sizeof(float)); re += DS_SC) {
+           chbuf[idx++] = (float)che[base + re].r;
+           chbuf[idx++] = (float)che[base + re].i;
+           cnt++;
+diff --git a/openair1/PHY/NR_UE_ESTIMATION/nr_dl_channel_estimation.c b/openair1/PHY/NR_UE_ESTIMATION/nr_dl_channel_estimation.c
+index 53c302e..537967c 100644
+--- a/openair1/PHY/NR_UE_ESTIMATION/nr_dl_channel_estimation.c
++++ b/openair1/PHY/NR_UE_ESTIMATION/nr_dl_channel_estimation.c
+@@ -34,6 +34,9 @@
+ #include <openair1/PHY/TOOLS/phy_scope_interface.h>
+ #include "nfapi/open-nFAPI/nfapi/public_inc/nfapi_nr_interface.h"
+ 
++#include <math.h>
++FILE *fpdlch = NULL;  // TinyTwin: per-rx-antenna DL channel power log (logs/dl_channel.txt)
++
+ 
+ extern openair0_config_t openair0_cfg[];
+ 
+@@ -830,6 +833,24 @@ int nr_pbch_channel_estimation(const NR_DL_FRAME_PARMS *fp,
+     }
+   }
+ 
++  // ---- TinyTwin: per-rx-antenna DL channel power from the SSB estimate ----
++  // Riding on PBCH means this samples every SSB period regardless of user traffic, so a
++  // replayed DL channel is observable without a PDU session. One line per SSB:
++  //   DLCH <ssb_counter> <nb_antennas_rx> <pow_rx0_dB> <pow_rx1_dB> ...
++  if (dmrss == lastsymbol && fpdlch) {
++    static unsigned long ssb_counter = 0;
++    fprintf(fpdlch, "DLCH %lu %d", ssb_counter++, fp->nb_antennas_rx);
++    for (int aarx = 0; aarx < fp->nb_antennas_rx; aarx++) {
++      const c16_t *ch = &dl_ch_estimates[aarx][ch_offset];
++      double e = 0.0;
++      for (int k = 0; k < (int)fp->ofdm_symbol_size; k++)
++        e += (double)ch[k].r * ch[k].r + (double)ch[k].i * ch[k].i;
++      fprintf(fpdlch, " %.4f", e > 0.0 ? 10.0 * log10(e) : -200.0);
++    }
++    fprintf(fpdlch, "\n");
++    fflush(fpdlch);  // SSB-rate, cheap; keeps the log usable while a run is live
++  }
++
+   return(0);
+ }
+ 
+diff --git a/openair1/PHY/NR_UE_TRANSPORT/csi_rx.c b/openair1/PHY/NR_UE_TRANSPORT/csi_rx.c
+index 23c7843..2c07eab 100644
+--- a/openair1/PHY/NR_UE_TRANSPORT/csi_rx.c
++++ b/openair1/PHY/NR_UE_TRANSPORT/csi_rx.c
+@@ -38,6 +38,28 @@
+ #include "PHY/phy_extern_nr_ue.h"
+ #include "PHY/NR_REFSIG/nr_refsig.h"
+ #include "common/utils/nr/nr_common.h"
++#include <zmq.h>
++
++// ---- TinyTwin: complex 4x4 DL CSI-RS channel dump -------------------------
++// Opened in nr-uesoftmodem.c from TT_DL_CSI_LOG. Power alone cannot reproduce
++// the generator's phase-ramp / AoA / singular-value metrics, so dump the full
++// complex [rx][tx][subcarrier] estimate and let the host side IFFT it to taps.
++FILE *fpdlcsi = NULL;
++int tt_csi_every = 1;    // keep every Nth CSI-RS occasion (TT_DL_CSI_EVERY)
++int tt_csi_max = 2000;   // stop after this many records (TT_DL_CSI_MAX)
++static int tt_csi_seen = 0, tt_csi_written = 0;
++
++// ---- TinyTwin: publish the same DL estimate to a RIC over ZMQ ----------------
++// The gNB's MIMO-RIC export carries the UPLINK (PUSCH DMRS). The replayed 4x4
++// channel lives on the DOWNLINK, at the UE, so a downlink xApp has to be fed
++// from here. PUB never blocks -- it drops when nobody is subscribed, which is
++// what we want on the PHY thread.
++void *tt_csi_zmq_ctx = NULL;
++void *tt_csi_zmq_pub = NULL;
++static unsigned int tt_csi_seq = 0;
++
++#define TT_CSI_MAGIC 0x54544358u   /* "TTCX" */
++#define TT_CSI_MAXF  (8 * 8 * 256 * 2)
+ #include "PHY/NR_UE_ESTIMATION/filt16a_32.h"
+ 
+ // Additional memory allocation, because of applying the filter and the memory offset to ensure memory alignment
+@@ -984,6 +1006,90 @@ void nr_ue_csi_rs_procedures(PHY_VARS_NR_UE *ue,
+                                  &log2_maxh,
+                                  &noise_power);
+ 
++  // ---- TinyTwin: dump the complex 4x4 CSI-RS channel ----------------------
++  // One record per kept CSI-RS occasion. Subcarrier stepping mirrors the RI/PMI
++  // loops exactly (same rb walk, same freq_density skip, same k_offset), so the
++  // sample grid matches what the receiver itself uses.
++  // ---- TT diagnostic: entry counter, logged unconditionally every 50 occasions ----
++  {
++    static unsigned long tt_entries = 0;
++    if ((tt_entries++ % 50) == 0)
++      LOG_I(NR_PHY, "TT-CSI: entry %lu  frame %d slot %d  bitmap %d  written %d\n",
++            tt_entries, proc->frame_rx, proc->nr_slot_rx,
++            csirs_config_pdu->measurement_bitmap, tt_csi_written);
++  }
++
++  if (fpdlcsi && csirs_config_pdu->measurement_bitmap > 1
++      && (tt_csi_seen++ % tt_csi_every) == 0 && tt_csi_written < tt_csi_max) {
++    const int nrx = frame_parms->nb_antennas_rx;
++    const int ntx = mapping_parms.ports;
++    int nsc = 0;
++    for (int rb = csirs_config_pdu->start_rb;
++         rb < (csirs_config_pdu->start_rb + csirs_config_pdu->nr_of_rbs); rb++) {
++      if (csirs_config_pdu->freq_density <= 1 && csirs_config_pdu->freq_density != (rb % 2))
++        continue;
++      nsc++;
++    }
++    fprintf(fpdlcsi, "CSI %d %d %d %d %d %d", tt_csi_written, proc->frame_rx, proc->nr_slot_rx, nrx, ntx, nsc);
++    for (int ant_rx = 0; ant_rx < nrx; ant_rx++) {
++      for (int port_tx = 0; port_tx < ntx; port_tx++) {
++        for (int rb = csirs_config_pdu->start_rb;
++             rb < (csirs_config_pdu->start_rb + csirs_config_pdu->nr_of_rbs); rb++) {
++          if (csirs_config_pdu->freq_density <= 1 && csirs_config_pdu->freq_density != (rb % 2))
++            continue;
++          uint16_t k = (frame_parms->first_carrier_offset + rb * NR_NB_SC_PER_RB) % frame_parms->ofdm_symbol_size;
++          const c16_t *h = (const c16_t *)&csi_rs_estimated_channel_freq[ant_rx][port_tx][k + mem_offset];
++          fprintf(fpdlcsi, " %d %d", h->r, h->i);
++        }
++      }
++    }
++    fprintf(fpdlcsi, "\n");
++    fflush(fpdlcsi);   // records are ~16 kB; without this a kill loses the tail
++    tt_csi_written++;
++    if (tt_csi_written == tt_csi_max)
++      LOG_I(NR_PHY, "TT CSI dump: reached TT_DL_CSI_MAX=%d records, stopping\n", tt_csi_max);
++  }
++
++  // ---- TinyTwin: same estimate, published to a downlink xApp -----------------
++  // Header is 7 uint32 (magic, seq, frame, slot, nrx, ntx, nsc) followed by
++  // nrx*ntx*nsc*2 float32 ordered [rx][tx][sc] as (re, im) -- the same walk as
++  // the file dump above, so both views agree sample for sample.
++  if (tt_csi_zmq_pub && csirs_config_pdu->measurement_bitmap > 1) {
++    const int nrx = frame_parms->nb_antennas_rx;
++    const int ntx = mapping_parms.ports;
++    int nsc = 0;
++    for (int rb = csirs_config_pdu->start_rb;
++         rb < (csirs_config_pdu->start_rb + csirs_config_pdu->nr_of_rbs); rb++) {
++      if (csirs_config_pdu->freq_density <= 1 && csirs_config_pdu->freq_density != (rb % 2))
++        continue;
++      nsc++;
++    }
++    const int nfloat = nrx * ntx * nsc * 2;
++    if (nfloat > 0 && nfloat <= TT_CSI_MAXF) {
++      static uint32_t hdr[7];
++      static float payload[TT_CSI_MAXF];
++      hdr[0] = TT_CSI_MAGIC; hdr[1] = tt_csi_seq++;
++      hdr[2] = (uint32_t)proc->frame_rx; hdr[3] = (uint32_t)proc->nr_slot_rx;
++      hdr[4] = (uint32_t)nrx; hdr[5] = (uint32_t)ntx; hdr[6] = (uint32_t)nsc;
++      int i = 0;
++      for (int ant_rx = 0; ant_rx < nrx; ant_rx++) {
++        for (int port_tx = 0; port_tx < ntx; port_tx++) {
++          for (int rb = csirs_config_pdu->start_rb;
++               rb < (csirs_config_pdu->start_rb + csirs_config_pdu->nr_of_rbs); rb++) {
++            if (csirs_config_pdu->freq_density <= 1 && csirs_config_pdu->freq_density != (rb % 2))
++              continue;
++            uint16_t k = (frame_parms->first_carrier_offset + rb * NR_NB_SC_PER_RB) % frame_parms->ofdm_symbol_size;
++            const c16_t *h = (const c16_t *)&csi_rs_estimated_channel_freq[ant_rx][port_tx][k + mem_offset];
++            payload[i++] = (float)h->r;
++            payload[i++] = (float)h->i;
++          }
++        }
++      }
++      zmq_send(tt_csi_zmq_pub, hdr, sizeof(hdr), ZMQ_SNDMORE | ZMQ_DONTWAIT);
++      zmq_send(tt_csi_zmq_pub, payload, nfloat * sizeof(float), ZMQ_DONTWAIT);
++    }
++  }
++
+   uint8_t rank_indicator = 0;
+   // bit 1 in bitmap to indicate RI measurment
+   if (csirs_config_pdu->measurement_bitmap & 2) {
+diff --git a/openair2/LAYER2/NR_MAC_UE/nr_ue_scheduler.c b/openair2/LAYER2/NR_MAC_UE/nr_ue_scheduler.c
+index 9003cc4..90f6ac2 100644
+--- a/openair2/LAYER2/NR_MAC_UE/nr_ue_scheduler.c
++++ b/openair2/LAYER2/NR_MAC_UE/nr_ue_scheduler.c
+@@ -1334,6 +1334,14 @@ void nr_ue_dl_scheduler(NR_UE_MAC_INST_t *mac, nr_downlink_indication_t *dl_info
+   if (mac->state == UE_NOT_SYNC || mac->state == UE_DETACHING)
+     return;
+ 
++  {   // ---- TT diagnostic: does the UE leave UE_CONNECTED mid-run? ----
++    static int tt_last_state = -1;
++    if (mac->state != tt_last_state) {
++      LOG_I(NR_MAC, "TT-UE-STATE: %d -> %d at frame %d slot %d\n",
++            tt_last_state, mac->state, rx_frame, rx_slot);
++      tt_last_state = mac->state;
++    }
++  }
+   if (mac->state == UE_CONNECTED) {
+     nr_schedule_csirs_reception(mac, rx_frame, rx_slot);
+     nr_schedule_csi_for_im(mac, rx_frame, rx_slot);
+@@ -2730,13 +2738,23 @@ void configure_csi_resource_mapping(fapi_nr_dl_config_csirs_pdu_rel15_t *csirs_c
+ 
+ void nr_schedule_csirs_reception(NR_UE_MAC_INST_t *mac, int frame, int slot)
+ {
+-  if (!mac->sc_info.csi_MeasConfig)
++  // ---- TT diagnostic: count why CSI-RS reception stops being scheduled ----
++  static unsigned long tt_call = 0, tt_no_cfg = 0, tt_no_list = 0, tt_no_bwp = 0, tt_sched = 0;
++  if ((tt_call++ % 20000) == 0)
++    LOG_I(NR_MAC, "TT-CSIRS-SCHED: calls %lu  scheduled %lu  | no_measconfig %lu  no_list %lu  bwp_mismatch %lu  (frame %d)\n",
++          tt_call, tt_sched, tt_no_cfg, tt_no_list, tt_no_bwp, frame);
++
++  if (!mac->sc_info.csi_MeasConfig) {
++    tt_no_cfg++;
+     return;
++  }
+ 
+   NR_CSI_MeasConfig_t *csi_measconfig = mac->sc_info.csi_MeasConfig;
+ 
+-  if (csi_measconfig->nzp_CSI_RS_ResourceToAddModList == NULL)
++  if (csi_measconfig->nzp_CSI_RS_ResourceToAddModList == NULL) {
++    tt_no_list++;
+     return;
++  }
+ 
+   fapi_nr_dl_config_request_t *dl_config = get_dl_config_request(mac, slot);
+   NR_UE_DL_BWP_t *current_DL_BWP = mac->current_DL_BWP;
+@@ -2754,8 +2772,11 @@ void nr_schedule_csirs_reception(NR_UE_MAC_INST_t *mac, int frame, int slot)
+       continue;
+     NR_CSI_ResourceConfigId_t csi_res_id = find_CSI_resourceconfig(csi_measconfig, dl_bwp_id, nzpcsi->nzp_CSI_RS_ResourceId);
+     // do not schedule reseption of this CSI-RS if not associated with current BWP
+-    if(csi_res_id < 0)
++    if(csi_res_id < 0) {
++      tt_no_bwp++;
+       continue;
++    }
++    tt_sched++;
+     LOG_D(MAC,"Scheduling reception of CSI-RS in frame %d slot %d\n", frame, slot);
+     fapi_nr_dl_config_csirs_pdu_rel15_t *csirs_config_pdu = &dl_config->dl_config_list[dl_config->number_pdus].csirs_config_pdu.csirs_config_rel15;
+     csirs_config_pdu->measurement_bitmap = set_csirs_measurement_bitmap(csi_measconfig, csi_res_id);
+diff --git a/openair2/LAYER2/NR_MAC_gNB/gNB_scheduler_dlsch.c b/openair2/LAYER2/NR_MAC_gNB/gNB_scheduler_dlsch.c
+index e954c29..0f544d3 100644
+--- a/openair2/LAYER2/NR_MAC_gNB/gNB_scheduler_dlsch.c
++++ b/openair2/LAYER2/NR_MAC_gNB/gNB_scheduler_dlsch.c
+@@ -1099,6 +1099,16 @@ static void pf_dl(module_id_t module_id,
+         sched_pdsch->mcs = get_mcs_from_bler_new(UE->rnti,bo, stats, &sched_ctrl->dl_bler_stats, max_mcs, frame);
+         //sched_pdsch->mcs = get_mcs_from_bler(bo, stats, &sched_ctrl->dl_bler_stats, max_mcs, frame);
+       sched_pdsch->nrOfLayers = get_dl_nrOfLayers(sched_ctrl, current_BWP->dci_format);
++      // DL rank + DL CQI to snr.txt, same "TTI Index / <NAME>: <val> RNTI: <rnti>" shape the
++      // experiment scripts already parse. nrOfLayers is the UE-reported RI + 1, so this is the
++      // observable that tracks a replayed DL MIMO channel.
++      if (fpsnr) {
++        fprintf(fpsnr, "TTI Index: %d\n", tti_counter);
++        fprintf(fpsnr, "DL RANK: %d RNTI: %04x\n", sched_pdsch->nrOfLayers, UE->rnti);
++        fprintf(fpsnr, "TTI Index: %d\n", tti_counter);
++        fprintf(fpsnr, "DL CQI: %d RNTI: %04x\n",
++                sched_ctrl->CSI_report.cri_ri_li_pmi_cqi_report.wb_cqi_1tb, UE->rnti);
++      }
+       sched_pdsch->pm_index =
+           get_pm_index(mac, UE, current_BWP->dci_format, sched_pdsch->nrOfLayers, mac->radio_config.pdsch_AntennaPorts.XP);
+       const uint8_t Qm = nr_get_Qm_dl(sched_pdsch->mcs, current_BWP->mcsTableIdx);
+diff --git a/openair2/LAYER2/NR_MAC_gNB/gNB_scheduler_ulsch.c b/openair2/LAYER2/NR_MAC_gNB/gNB_scheduler_ulsch.c
+index 9d3a998..ef6f223 100644
+--- a/openair2/LAYER2/NR_MAC_gNB/gNB_scheduler_ulsch.c
++++ b/openair2/LAYER2/NR_MAC_gNB/gNB_scheduler_ulsch.c
+@@ -39,6 +39,16 @@
+ #include "LAYER2/RLC/rlc.h"
+ #include "./../../../executables/edgeric/wrapper.h"
+ 
++// ---- TinyTwin: 4x4 uplink channel, exported from SRS -----------------------
++// PUSCH DMRS is per-layer and UL rank is 1, so it can only give H[rx] (4x1).
++// SRS is sounded per UE antenna port, so the codebook report below carries the
++// full H[gNB antenna][UE port][PRG] -- the only 4x4 uplink matrix in the stack.
++// Opened in nr-softmodem.c from TT_UL_SRS_LOG. Written in the same text format
++// as the UE's dl_csi_ue1.txt so the downlink alignment tooling reads it as-is.
++FILE *fpulsrs = NULL;
++int tt_srs_every = 1;    // SRS period ~ CSI-RS cadence (n_slots_period*16); keep all by default
++int tt_srs_max = 2000;   // record cap, bounds the file (TT_UL_SRS_MAX)
++
+ // #define SRS_IND_DEBUG
+ 
+ extern int tptlog;
+@@ -1465,6 +1475,44 @@ void handle_nr_srs_measurements(const module_id_t module_id,
+       }
+ #endif
+ 
++      // ---- TinyTwin: dump the SRS channel matrix -----------------------------
++      // Written as [rx = gNB antenna][tx = UE port][sc = PRG], matching the DL
++      // CSI-RS dump's [rx][tx][sc], so rx/tx mean "receiving/transmitting side"
++      // in both files. Source layout (nfapi_nr_interface_scf.h):
++      //   channel_matrix[uI*Ng*Np + gI*Np + pI]
++      {
++        static unsigned long tt_srs_seen = 0;
++        static int tt_srs_written = 0;
++        const int Ng = nr_srs_channel_iq_matrix.num_gnb_antenna_elements;
++        const int Nu = nr_srs_channel_iq_matrix.num_ue_srs_ports;
++        const int Np = nr_srs_channel_iq_matrix.num_prgs;
++        const int iq16 = nr_srs_channel_iq_matrix.normalized_iq_representation;
++        if ((tt_srs_seen % 200) == 0)
++          LOG_I(NR_MAC, "TT-SRS: report %lu  gNB_ant %d  UE_ports %d  PRGs %d (prg_size %d)  iq16 %d  written %d\n",
++                tt_srs_seen, Ng, Nu, Np, nr_srs_channel_iq_matrix.prg_size, iq16, tt_srs_written);
++        if (fpulsrs && Ng > 0 && Nu > 0 && Np > 0
++            && (tt_srs_seen % tt_srs_every) == 0 && tt_srs_written < tt_srs_max) {
++          const c16_t *m16 = (const c16_t *)nr_srs_channel_iq_matrix.channel_matrix;
++          const c8_t *m8 = (const c8_t *)nr_srs_channel_iq_matrix.channel_matrix;
++          fprintf(fpulsrs, "SRS %d %d %d %d %d %d", tt_srs_written, frame, slot, Ng, Nu, Np);
++          for (int gI = 0; gI < Ng; gI++)
++            for (int uI = 0; uI < Nu; uI++)
++              for (int pI = 0; pI < Np; pI++) {
++                const int idx = uI * Ng * Np + gI * Np + pI;
++                if (iq16)
++                  fprintf(fpulsrs, " %d %d", m16[idx].r, m16[idx].i);
++                else
++                  fprintf(fpulsrs, " %d %d", m8[idx].r, m8[idx].i);
++              }
++          fprintf(fpulsrs, "\n");
++          fflush(fpulsrs);
++          tt_srs_written++;
++          if (tt_srs_written == tt_srs_max)
++            LOG_I(NR_MAC, "TT-SRS: reached TT_UL_SRS_MAX=%d records, stopping dump\n", tt_srs_max);
++        }
++        tt_srs_seen++;
++      }
++
+       NR_UE_sched_ctrl_t *sched_ctrl = &UE->UE_sched_ctrl;
+       NR_UE_UL_BWP_t *current_BWP = &UE->current_UL_BWP;
+       sched_ctrl->srs_feedback.sri = NR_SRS_SRI_0;
+diff --git a/radio/rfsimulator/apply_channelmod.c b/radio/rfsimulator/apply_channelmod.c
+index e3c7904..ab0fadc 100644
+--- a/radio/rfsimulator/apply_channelmod.c
++++ b/radio/rfsimulator/apply_channelmod.c
+@@ -25,6 +25,8 @@
+ #include <time.h>
+ #include <stdio.h>
+ #include <complex.h>
++#include <string.h>
++#include <stdbool.h>
+ #include <common/utils/LOG/log.h>
+ #include <openair1/SIMULATION/TOOLS/sim.h>
+ #include "rfsimulator.h"
+@@ -45,6 +47,11 @@ extern FILE *fpi_jam[50]; // jammer taps, imag part
+ extern int jam_enable;    // 0/1 from --JAM
+ extern double jam_gain;   // linear output gain from --JGAIN
+ extern int jamtaplen;     // number of jammer taps from --JTAP (default 64)
++
++/* Max taps the per-socket H cache holds per rx row (nb_tx*taplen), and the read
++   buffer that must fit that many scientific-notation fields on one line. */
++#define _MIMO_MAXTAPS 1024
++#define _MIMO_MAXLINE (_MIMO_MAXTAPS * 20)
+ //extern int counterr;
+  //int counter=0;
+ //  FILE *fpr;
+@@ -73,6 +80,31 @@ extern int jamtaplen;     // number of jammer taps from --JTAP (default 64)
+   either we regenerate the channel (call again random_channel(desc,0)), or we keep it over subframes
+   legacy: we regenerate each sub frame in UL, and each frame only in DL
+ */
++/* Read one tap line, rewinding at EOF so the channel file loops.
++   Tap lines are wide: nb_tx*taplen fields in scientific notation (a 4x4 @ 64 taps
++   line is ~4.2 kB), so the caller's buffer must hold a whole line. A short buffer
++   silently splits one line across successive reads and de-syncs the rx rows, so
++   warn once and drop the remainder of the line instead. */
++static bool readTapLine(FILE *f, char *buf, size_t bufSize)
++{
++  if (fgets(buf, bufSize, f) == NULL) {
++    rewind(f);
++    if (fgets(buf, bufSize, f) == NULL)
++      return false;
++  }
++  if (strchr(buf, '\n') == NULL && !feof(f)) {
++    static bool warned = false;
++    if (!warned) {
++      warned = true;
++      LOG_E(HW, "channel tap line exceeds the %zu-byte read buffer; taps are being truncated\n", bufSize);
++    }
++    int c;
++    while ((c = fgetc(f)) != EOF && c != '\n')
++      ;
++  }
++  return true;
++}
++
+ void rxAddInput(const c16_t *input_sig,
+                 c16_t *after_channel_sig,
+                 int rxAnt,
+@@ -80,10 +112,11 @@ void rxAddInput(const c16_t *input_sig,
+                 int nbSamples,
+                 uint64_t TS,
+                 uint32_t CirSize,
+-                uint32_t sock_num)
++                uint32_t sock_num,
++                int nbTxStream)
+ {
+   
+-  char strr[2000],stri[2000];
++  char strr[_MIMO_MAXLINE], stri[_MIMO_MAXLINE];
+   static int line_count = 0;  
+  
+   //fgets(strr, sizeof(strr), fpr);
+@@ -169,7 +202,11 @@ void rxAddInput(const c16_t *input_sig,
+   // the normalized OAI value seems to be 256 as average amplitude (numerical amplification = 1)
+   const double noise_per_sample = pow(10,channelDesc->noise_power_dB/10.0) * 256;
+   const uint64_t dd = channelDesc->channel_offset;
+-  const int nbTx=channelDesc->nb_tx;
++  // The circular buffer is interleaved by the SENDER's antenna count, and the channel has
++  // one tx column per transmitted stream. channelDesc->nb_tx is this node's own tx antenna
++  // count, which is not the same thing (a 1-tx gNB talking to a 4-tx UE differs), so using it
++  // as the stride reads the buffer scrambled. Trust the stream count from the packet header.
++  const int nbTx = (nbTxStream > 0) ? nbTxStream : channelDesc->nb_tx;
+    // counterr++;
+   // int mylen=1;
+   // --- MIMO channel matrix, cached per receive cycle (fixes the nb_rx>1 de-sync) ------
+@@ -179,8 +216,8 @@ void rxAddInput(const c16_t *input_sig,
+   //   [txAnt*taplen + l]; nb_tx*taplen must be <= 1024.
+   #define _MIMO_MAXSOCK 8
+   #define _MIMO_MAXRX   8
+-  static float Hr_cache[_MIMO_MAXSOCK][_MIMO_MAXRX][8*128];
+-  static float Hi_cache[_MIMO_MAXSOCK][_MIMO_MAXRX][8*128];
++  static float Hr_cache[_MIMO_MAXSOCK][_MIMO_MAXRX][_MIMO_MAXTAPS];
++  static float Hi_cache[_MIMO_MAXSOCK][_MIMO_MAXRX][_MIMO_MAXTAPS];
+   const int nbRx = channelDesc->nb_rx;
+   int si = (int)sock_num - first_time;
+   if (si < 0) si = 0;
+@@ -201,20 +238,33 @@ void rxAddInput(const c16_t *input_sig,
+ 
+     // Load the full nb_rx x nb_tx channel matrix ONCE per cycle (on the rxAnt==0 call);
+     // one file line per rx antenna. Other rx antennas reuse the cache via the row pointers.
+-    if (rxAnt == 0) {
++    if (rxAnt == 0 && fpr[si] != NULL && fpi[si] != NULL) {
+       for (int r = 0; r < nbRx && r < _MIMO_MAXRX; r++) {
+-        if (fgets(strr, sizeof(strr), fpr[si]) == NULL) { rewind(fpr[si]); if (fgets(strr, sizeof(strr), fpr[si]) == NULL) break; }
++        if (!readTapLine(fpr[si], strr, sizeof(strr))) break;
+         char *tk = strtok(strr, " ");
+         int k = 0;
+-        for (; tk != NULL && k < nbTx*taplen && k < 8*128; k++) { Hr_cache[si][r][k] = atof(tk); tk = strtok(NULL, " "); }
+-        for (; k < 8*128; k++) Hr_cache[si][r][k] = 0.0f;
+-        if (fgets(stri, sizeof(stri), fpi[si]) == NULL) { rewind(fpi[si]); if (fgets(stri, sizeof(stri), fpi[si]) == NULL) break; }
++        for (; tk != NULL && k < nbTx*taplen && k < _MIMO_MAXTAPS; k++) { Hr_cache[si][r][k] = atof(tk); tk = strtok(NULL, " "); }
++        for (; k < _MIMO_MAXTAPS; k++) Hr_cache[si][r][k] = 0.0f;
++        if (!readTapLine(fpi[si], stri, sizeof(stri))) break;
+         tk = strtok(stri, " ");
+         k = 0;
+-        for (; tk != NULL && k < nbTx*taplen && k < 8*128; k++) { Hi_cache[si][r][k] = atof(tk); tk = strtok(NULL, " "); }
+-        for (; k < 8*128; k++) Hi_cache[si][r][k] = 0.0f;
++        for (; tk != NULL && k < nbTx*taplen && k < _MIMO_MAXTAPS; k++) { Hi_cache[si][r][k] = atof(tk); tk = strtok(NULL, " "); }
++        for (; k < _MIMO_MAXTAPS; k++) Hi_cache[si][r][k] = 0.0f;
+       }
+       line_count += nbRx;
++      { // one-shot diagnostic: what is the replay actually applying?
++        static int diag = 0;
++        if (!diag) {
++          diag = 1;
++          fprintf(stderr, "[REPLAY-DIAG] taplen=%d nbTx=%d nbRx=%d pathloss_dB=%f noise_dB=%f dd=%lu CirSize=%u\n",
++                  taplen, nbTx, nbRx, channelDesc->path_loss_dB, channelDesc->noise_power_dB,
++                  (unsigned long)dd, CirSize);
++          fprintf(stderr, "[REPLAY-DIAG] H[0][tx*taplen+0] =");
++          for (int tx = 0; tx < nbTx; tx++)
++            fprintf(stderr, " %g", Hr_cache[si][0][tx*taplen+0]);
++          fprintf(stderr, "\n");
++        }
++      }
+       if (line_count % 1000 < nbRx) printf("TTI %llu: MIMO channel rows loaded, sock %u\n", TS, sock_num);
+     }
+ 
+diff --git a/radio/rfsimulator/rfsimulator.h b/radio/rfsimulator/rfsimulator.h
+index 538803d..17696e8 100644
+--- a/radio/rfsimulator/rfsimulator.h
++++ b/radio/rfsimulator/rfsimulator.h
+@@ -30,7 +30,8 @@ void rxAddInput( const c16_t *input_sig,
+                  int nbSamples,
+                  uint64_t TS,
+                  uint32_t CirSize,
+-                 uint32_t sock_num
++                 uint32_t sock_num,
++                 int nbTxStream   // sender's antenna count: the circular buffer's interleave stride
+                );
+ 
+ void txAddInput(const c16_t *input_sig,
+diff --git a/radio/rfsimulator/simulator.c b/radio/rfsimulator/simulator.c
+index bdf1ad9..05e9d4d 100644
+--- a/radio/rfsimulator/simulator.c
++++ b/radio/rfsimulator/simulator.c
+@@ -120,6 +120,7 @@ typedef enum { SIMU_ROLE_SERVER = 1, SIMU_ROLE_CLIENT } simuRole;
+ extern FILE *fplog3;
+ extern int first_time;
+ extern int gnb1_ue0;
++extern int ul_chan_enable;
+ extern int taplen;
+ 
+ static void getset_currentchannels_type(char *buf, int debug, webdatadef_t *tdata, telnet_printfunc_t prnt);
+@@ -1024,7 +1025,10 @@ static int rfsimulator_read(openair0_device *device, openair0_timestamp *ptimest
+       // // MIMO should be handled here // //
+       for (int a=0; a<nbAnt; a++) {//loop over number of Rx antennas
+ 
+-        if ( ptr->channel_model != NULL && gnb1_ue0==0 && taplen>0) { // apply a channel model
++        // The UE replays on its rx path (DL). With --ULCHAN 1 the gNB does the same on its
++        // rx path, so the UL carries the replayed MIMO H instead of rfsim's H_awgn_mimo
++        // placeholder below -- that is what makes the UL channel visible to the MIMO-RIC export.
++        if ( ptr->channel_model != NULL && (gnb1_ue0==0 || ul_chan_enable) && taplen>0) { // apply a channel model
+           // log time
+           struct timespec start; // Structs to store time
+           clock_gettime(CLOCK_REALTIME, &start);
+@@ -1038,7 +1042,8 @@ static int rfsimulator_read(openair0_device *device, openair0_timestamp *ptimest
+                      nsamps,
+                      t->nextRxTstamp,
+                      CirSize,
+-                     sock);
++                     sock,
++                     ptr->th.nbAnt);
+         }
+         else { // no channel modeling
+           int nbAnt_tx = ptr->th.nbAnt; // number of Tx antennas
+diff --git a/sims/siso/tti_experiments/docker-compose.yaml b/sims/siso/tti_experiments/docker-compose.yaml
+index 4a55e29..eec22db 100644
+--- a/sims/siso/tti_experiments/docker-compose.yaml
++++ b/sims/siso/tti_experiments/docker-compose.yaml
+@@ -24,9 +24,20 @@ services:
+         #     /bin/bash -c "pwd && cd tt/cmake_targets/ran_build/build/ &&
+         #     ./nr-softmodem -O ../../../targets/PROJECTS/GENERIC-NR-5GC/CONF/gnb.sa.band78.fr1.106PRB.usrpb210.conf --rfsim -E --sa  -TP 10 --TTI 1 --SNR 1
+         #     exec /bin/bash"
++        environment:
++            # UL tap set replayed on the gNB rx path when --ULCHAN 1 is passed below.
++            # Without this the gNB falls back to "signal_metal", which is a SISO-era
++            # file (64 cols x 800 lines) and the wrong shape for a 4x4 replay.
++            - TT_UL_CHAN_SIGNAL=signal_metal_4x4
++            # 4x4 uplink channel from SRS (DMRS is per-layer, so only 4x1 at rank 1).
++            - TT_UL_SRS_LOG=/opt/tt-ran/tt/logs/ul_srs_gnb.txt
++            # SRS period is n_slots_period * MAX_MOBILES_PER_GNB(16) -- roughly the
++            # CSI-RS cadence, NOT every few slots. Keep every report.
++            - TT_UL_SRS_EVERY=1
++            - TT_UL_SRS_MAX=2000
+         entrypoint: >    
+             /bin/bash -c "cd /opt/tt-ran/tt/cmake_targets/ran_build/build/ &&    
+-            ./nr-softmodem -O /opt/tt-ran/etc/gnb.conf --rfsim -E --sa --SNR 1 --MCS 1 --CQI 1 --TPT 1 &&
++            ./nr-softmodem -O /opt/tt-ran/etc/gnb.conf --rfsim -E --sa --SNR 1 --MCS 1 --CQI 1 --TPT 1 --rfsimulator.options chanmod --TAP 64 --ULCHAN 1 &&
+             exec /bin/bash"
+         stdin_open: true  # docker run -i
+         tty: true        # docker run -t
+@@ -57,9 +68,23 @@ services:
+             # - ../../../channel/channel.txt:/opt/tt-ran/channel/channel_gradual.txt
+             - ../../../ci-scripts/conf_files/nrue.uicc.conf:/opt/oai-nr-ue/etc/nr-ue.conf
+             - ../../../logs_ue:/opt/oai-nr-ue/etc/logs
++        environment:
++            # DL tap set replayed on the UE rx path; CHAN_STEM selects the file under channel/
++            - TT_CHAN_SIGNAL=signal_metal_4x4
++            # Per-UE DL channel log. All UEs share the repo bind mount, so the default
++            # logs/dl_channel.txt would have every UE clobbering the same file.
++            - TT_DL_CHAN_LOG=/opt/tt-ran/tt/logs/dl_channel_ue1.txt
++            # Complex 4x4 CSI-RS dump -- the only capture that can reproduce the
++            # generator's phase-ramp / AoA / singular-value metrics end to end.
++            - TT_DL_CSI_LOG=/opt/tt-ran/tt/logs/dl_csi_ue1.txt
++            - TT_DL_CSI_EVERY=${TT_DL_CSI_EVERY:-1}
++            - TT_DL_CSI_MAX=${TT_DL_CSI_MAX:-2000}
++            # Downlink CSI over ZMQ, so an xApp can see the REPLAYED channel.
++            # The gNB's MIMO-RIC export is uplink-only. Port 5558 per UE.
++            - TT_DL_CSI_ZMQ=tcp://0.0.0.0:5558
+         entrypoint: >
+             /bin/bash -c "ls && cd tt/cmake_targets/ran_build/build/ &&
+-            ./nr-uesoftmodem --uicc0.imsi 208990100001111 -C 3619200000 -r 106 --numerology 1 --ssb 516 -E --sa --rfsim -O ../../../ci-scripts/conf_files/nrue.uicc.conf --ue-nb-ant-rx 4 --ue-nb-ant-tx 4 --rfsimulator.serveraddr 192.168.70.140 &&
++            ./nr-uesoftmodem --uicc0.imsi 208990100001111 -C 3619200000 -r 106 --numerology 1 --ssb 516 -E --sa --rfsim -O ../../../ci-scripts/conf_files/nrue.uicc.conf --ue-nb-ant-rx 4 --ue-nb-ant-tx 4 --uecap_file ../../../targets/PROJECTS/GENERIC-NR-5GC/CONF/uecap_ports4.xml --rfsimulator.options chanmod --TAP 64 --rfsimulator.serveraddr 192.168.70.140 &&
+             exec /bin/bash"
+         # entrypoint: /bin/bash
+         stdin_open: true  
+@@ -89,6 +114,16 @@ services:
+             /bin/bash -c "cd /home/EdgeRIC &&  
+             python3 ./muApp3/muApp3_monitor_grafana.py &&  
+             exec /bin/bash"
++        environment:
++            # MIMO-RIC channel dump: muApp3 appends every ZMQ report to
++            # edgeric-v2/results/ul_channel_power_<stamp>.txt on the host.
++            # TT_CHAN_LOG=0 disables, TT_CHAN_LOG_RAW=1 also dumps the complex samples,
++            # TT_CHAN_LOG_EVERY=N keeps every Nth report.
++            - TT_CHAN_LOG=${TT_CHAN_LOG:-1}
++            # Raw complex UL samples. Needed for any phase metric -- the power
++            # dump alone cannot show a phase ramp or a covariance eigenvector.
++            - TT_CHAN_LOG_RAW=${TT_CHAN_LOG_RAW:-0}
++            - TT_CHAN_LOG_EVERY=${TT_CHAN_LOG_EVERY:-1}
+         # privileged mode is requred only for accessing usb devices
+         privileged: true
+         ports:
+diff --git a/sims/siso/tti_experiments/edgeric-v2/muApp3/muApp3_monitor_grafana.py b/sims/siso/tti_experiments/edgeric-v2/muApp3/muApp3_monitor_grafana.py
+index 165eb30..7c3126b 100644
+--- a/sims/siso/tti_experiments/edgeric-v2/muApp3/muApp3_monitor_grafana.py
++++ b/sims/siso/tti_experiments/edgeric-v2/muApp3/muApp3_monitor_grafana.py
+@@ -43,13 +43,44 @@ class PrometheusMonitor:
+         self.avg_tot_ul_buffer_gauge = Gauge('tot_avg_ul_buffer', 'tot Average UL Buffer', ['non'])
+         self.avg_tot_tx_throughput_gauge = Gauge('tot_avg_tx_throughput', 'tot Average TX Throughput', ['non'])
+         self.avg_tot_rx_throughput_gauge = Gauge('tot_avg_rx_throughput', 'tot Average RX Throughput', ['non'])
+-        
++
++        # MIMO-RIC: per-rx-antenna UL channel power. ul_channel arrives flattened
++        # as nrx x nsc x (re,im); collapsing each antenna to a power in dB gives
++        # one series per rx antenna, which is what shows the 4x4 is really live.
++        self.ul_channel_power_gauge = Gauge('ue_ul_channel_power_db', 'UE per-rx-antenna UL channel power (dB)', ['rnti', 'rx'])
++        self.ul_channel_nrx_gauge = Gauge('ue_ul_channel_nrx', 'UE rx antennas reporting UL channel', ['rnti'])
++
++        # MIMO-RIC: continuous dump of the ZMQ channel reports to disk. Prometheus keeps
++        # only the newest value per series, so anything to be compared offline has to be
++        # appended as it arrives. Written under the ./edgeric-v2 bind mount so the files
++        # land on the host.
++        self.chan_log_dir = os.environ.get("TT_CHAN_LOG_DIR", "/home/EdgeRIC/results")
++        self.chan_log_every = max(1, int(os.environ.get("TT_CHAN_LOG_EVERY", "1")))
++        self.chan_log_raw = os.environ.get("TT_CHAN_LOG_RAW", "0") == "1"
++        self.chan_rx_count = 0
++        self.chan_pow_file = None
++        self.chan_raw_file = None
++        if os.environ.get("TT_CHAN_LOG", "1") != "0":
++            os.makedirs(self.chan_log_dir, exist_ok=True)
++            stamp = os.environ.get("TT_CHAN_LOG_TAG") or time.strftime("%Y%m%d-%H%M%S")
++            pow_path = os.path.join(self.chan_log_dir, f"ul_channel_power_{stamp}.txt")
++            self.chan_pow_file = open(pow_path, "w", buffering=1)
++            self.chan_pow_file.write("wallclock,tti,rnti,nrx,nsc,rx,power_db\n")
++            print(f"[MIMO-RIC] logging per-antenna channel power to {pow_path}", flush=True)
++            if self.chan_log_raw:
++                raw_path = os.path.join(self.chan_log_dir, f"ul_channel_raw_{stamp}.txt")
++                self.chan_raw_file = open(raw_path, "w", buffering=1)
++                # variable-width: header names the fixed prefix, then nrx*nsc*2 floats
++                self.chan_raw_file.write("wallclock,tti,rnti,nrx,nsc,samples[rx][sc][re,im]...\n")
++                print(f"[MIMO-RIC] logging raw channel samples to {raw_path}", flush=True)
++
+         start_http_server(self.port)
+ 
+ 
+     def update_metrics(self):
+         while True:
+             self.tti_count, self.ue_dict = self.messenger.get_metrics(True)
++            self.chan_rx_count += 1
+             #self.tti_count_gauge.set(self.ran_tti)
+             avg_tx_throughput_tot=[]
+             avg_rx_throughput_tot=[]
+@@ -73,6 +104,7 @@ class PrometheusMonitor:
+                 self.avg_rx_throughput_gauge.labels(rnti=rnti).set(avg_rx_throughput)
+                 self.avg_dl_buffer_gauge.labels(rnti=rnti).set(avg_dl_buffer)
+                 self.avg_ul_buffer_gauge.labels(rnti=rnti).set(avg_ul_buffer)
++                self.publish_ul_channel(rnti, metrics)
+ 
+             self.avg_tot_tx_throughput_gauge.labels(non=1).set(sum(avg_tx_throughput_tot))
+             self.avg_tot_rx_throughput_gauge.labels(non=1).set(sum(avg_rx_throughput_tot))
+@@ -86,6 +118,36 @@ class PrometheusMonitor:
+ 
+             
+ 
++    def publish_ul_channel(self, rnti, metrics):
++        """Collapse the flattened ul_channel into one power-in-dB series per rx antenna."""
++        chan = metrics.get('ul_channel') or []
++        nrx = metrics.get('ul_channel_nrx') or 0
++        nsc = metrics.get('ul_channel_nsc') or 0
++        if not chan or nrx <= 0 or nsc <= 0:
++            return
++        self.ul_channel_nrx_gauge.labels(rnti=rnti).set(nrx)
++        # expected layout: nrx * nsc * 2 floats (re, im)
++        if len(chan) < nrx * nsc * 2:
++            return
++        arr = np.asarray(chan[:nrx * nsc * 2], dtype=np.float64).reshape(nrx, nsc, 2)
++        power = (arr[:, :, 0] ** 2 + arr[:, :, 1] ** 2).mean(axis=1)
++        db = [10.0 * np.log10(p) if p > 0 else -200.0 for p in power]
++        for rx in range(nrx):
++            self.ul_channel_power_gauge.labels(rnti=rnti, rx=rx).set(db[rx])
++        self.log_ul_channel(rnti, nrx, nsc, db, chan)
++
++    def log_ul_channel(self, rnti, nrx, nsc, db, chan):
++        """Append this report to the txt logs, one row per rx antenna (plus raw if enabled)."""
++        if self.chan_pow_file is None or (self.chan_rx_count % self.chan_log_every):
++            return
++        now = time.time()
++        for rx in range(nrx):
++            self.chan_pow_file.write(
++                f"{now:.6f},{self.tti_count},{rnti},{nrx},{nsc},{rx},{db[rx]:.6f}\n")
++        if self.chan_raw_file is not None:
++            samples = ",".join(f"{v:.6g}" for v in chan[:nrx * nsc * 2])
++            self.chan_raw_file.write(f"{now:.6f},{self.tti_count},{rnti},{nrx},{nsc},{samples}\n")
++
+     def calculate_moving_avg(self, rnti, metrics):
+       
+         if rnti not in self.tx_bytes_history:
+diff --git a/sims/siso/tti_experiments/tti_multiue_experiments_demo1.py b/sims/siso/tti_experiments/tti_multiue_experiments_demo1.py
+index 098a2b0..043271a 100644
+--- a/sims/siso/tti_experiments/tti_multiue_experiments_demo1.py
++++ b/sims/siso/tti_experiments/tti_multiue_experiments_demo1.py
+@@ -1,5 +1,6 @@
+ import sys
+ import os
++import glob
+ import time
+ import threading
+ import numpy as np
+@@ -13,7 +14,11 @@ end_ue = int(sys.argv[1])
+ start_tap = int(sys.argv[2])
+ end_tap = int(sys.argv[2])
+ 
+-start='''
++# Tap file replayed on the DL, as a stem under channel/ (minus _real.txt / _imag.txt).
++# argv[3] overrides it. The tap count (argv[2]) must match the file's taps-per-tx.
++CHAN_STEM = sys.argv[3] if len(sys.argv) > 3 else "signal_metal_4x4"
++
++start=f'''
+ services:
+     tt-gnb:
+         image: tt-gnb:v2
+@@ -39,9 +44,20 @@ services:
+         #     /bin/bash -c "pwd && cd tt/cmake_targets/ran_build/build/ &&
+         #     ./nr-softmodem -O ../../../targets/PROJECTS/GENERIC-NR-5GC/CONF/gnb.sa.band78.fr1.106PRB.usrpb210.conf --rfsim -E --sa  -TP 10 --TTI 1 --SNR 1
+         #     exec /bin/bash"
++        environment:
++            # UL tap set replayed on the gNB rx path when --ULCHAN 1 is passed below.
++            # Without this the gNB falls back to "signal_metal", which is a SISO-era
++            # file (64 cols x 800 lines) and the wrong shape for a 4x4 replay.
++            - TT_UL_CHAN_SIGNAL={CHAN_STEM}
++            # 4x4 uplink channel from SRS (DMRS is per-layer, so only 4x1 at rank 1).
++            - TT_UL_SRS_LOG=/opt/tt-ran/tt/logs/ul_srs_gnb.txt
++            # SRS period is n_slots_period * MAX_MOBILES_PER_GNB(16) -- roughly the
++            # CSI-RS cadence, NOT every few slots. Keep every report.
++            - TT_UL_SRS_EVERY=1
++            - TT_UL_SRS_MAX=2000
+         entrypoint: >    
+             /bin/bash -c "cd /opt/tt-ran/tt/cmake_targets/ran_build/build/ &&    
+-            ./nr-softmodem -O /opt/tt-ran/etc/gnb.conf --rfsim -E --sa --SNR 1 --MCS 1 --CQI 1 --TPT 1 &&
++            ./nr-softmodem -O /opt/tt-ran/etc/gnb.conf --rfsim -E --sa --SNR 1 --MCS 1 --CQI 1 --TPT 1 --rfsimulator.options chanmod --TAP {start_tap} --ULCHAN 1 &&
+             exec /bin/bash"
+         stdin_open: true  # docker run -i
+         tty: true        # docker run -t
+@@ -71,6 +87,16 @@ end='''
+             /bin/bash -c "cd /home/EdgeRIC &&  
+             python3 ./muApp3/muApp3_monitor_grafana.py &&  
+             exec /bin/bash"
++        environment:
++            # MIMO-RIC channel dump: muApp3 appends every ZMQ report to
++            # edgeric-v2/results/ul_channel_power_<stamp>.txt on the host.
++            # TT_CHAN_LOG=0 disables, TT_CHAN_LOG_RAW=1 also dumps the complex samples,
++            # TT_CHAN_LOG_EVERY=N keeps every Nth report.
++            - TT_CHAN_LOG=${TT_CHAN_LOG:-1}
++            # Raw complex UL samples. Needed for any phase metric -- the power
++            # dump alone cannot show a phase ramp or a covariance eigenvector.
++            - TT_CHAN_LOG_RAW=${TT_CHAN_LOG_RAW:-0}
++            - TT_CHAN_LOG_EVERY=${TT_CHAN_LOG_EVERY:-1}
+         # privileged mode is requred only for accessing usb devices
+         privileged: true
+         ports:
+@@ -286,9 +312,23 @@ def create_docker(i, n_tap):
+             # - ../../../channel/channel.txt:/opt/tt-ran/channel/channel_gradual.txt
+             - ../../../ci-scripts/conf_files/nrue.uicc.conf:/opt/oai-nr-ue/etc/nr-ue.conf
+             - ../../../logs_ue:/opt/oai-nr-ue/etc/logs
++        environment:
++            # DL tap set replayed on the UE rx path; CHAN_STEM selects the file under channel/
++            - TT_CHAN_SIGNAL={CHAN_STEM}
++            # Per-UE DL channel log. All UEs share the repo bind mount, so the default
++            # logs/dl_channel.txt would have every UE clobbering the same file.
++            - TT_DL_CHAN_LOG=/opt/tt-ran/tt/logs/dl_channel_ue{i-160}.txt
++            # Complex 4x4 CSI-RS dump -- the only capture that can reproduce the
++            # generator's phase-ramp / AoA / singular-value metrics end to end.
++            - TT_DL_CSI_LOG=/opt/tt-ran/tt/logs/dl_csi_ue{i-160}.txt
++            - TT_DL_CSI_EVERY=${{TT_DL_CSI_EVERY:-1}}
++            - TT_DL_CSI_MAX=${{TT_DL_CSI_MAX:-2000}}
++            # Downlink CSI over ZMQ, so an xApp can see the REPLAYED channel.
++            # The gNB's MIMO-RIC export is uplink-only. Port 5558 per UE.
++            - TT_DL_CSI_ZMQ=tcp://0.0.0.0:{5558 + i - 161}
+         entrypoint: >
+             /bin/bash -c "ls && cd tt/cmake_targets/ran_build/build/ &&
+-            ./nr-uesoftmodem --uicc0.imsi 2089901000011{i-150} -C 3619200000 -r 106 --numerology 1 --ssb 516 -E --sa --rfsim -O ../../../ci-scripts/conf_files/nrue.uicc.conf --ue-nb-ant-rx 4 --ue-nb-ant-tx 4 --rfsimulator.serveraddr 192.168.70.140 &&
++            ./nr-uesoftmodem --uicc0.imsi 2089901000011{i-150} -C 3619200000 -r 106 --numerology 1 --ssb 516 -E --sa --rfsim -O ../../../ci-scripts/conf_files/nrue.uicc.conf --ue-nb-ant-rx 4 --ue-nb-ant-tx 4 --uecap_file ../../../targets/PROJECTS/GENERIC-NR-5GC/CONF/uecap_ports4.xml --rfsimulator.options chanmod --TAP {n_tap} --rfsimulator.serveraddr 192.168.70.140 &&
+             exec /bin/bash"
+         # entrypoint: /bin/bash
+         stdin_open: true  
+@@ -367,7 +407,9 @@ def autoUE():
+             time.sleep(5)
+             os.system(f"""top -bn6 > ./plot/ue{kk}_{ktap}/iperf_cpumem.txt """)
+             #test
+-            time.sleep(1800)  # main run duration: 30 min
++            # Main run duration. TT_RUN_SECONDS shortens it for smoke tests;
++            # the default keeps the original 30-minute window.
++            time.sleep(int(os.environ.get("TT_RUN_SECONDS", "1800")))
+             print("kill gnb")
+             os.system(f"docker exec tt-gnb chmod +x stop.sh ")
+             os.system(f"docker exec -d tt-gnb ./stop.sh ")
+@@ -636,6 +678,58 @@ def processDATA():
+             
+             os.system(f"cp ../../../logs/tti.txt ./plot/ue{kk}_{ktap}/tti.txt")
+             os.system(f"cp ../../../logs/snr.txt ./plot/ue{kk}_{ktap}/snr.txt")
++
++            # MIMO-RIC channel dumps written by muApp3 through the edgeric-v2 bind mount
++            os.system(f"cp ./edgeric-v2/results/ul_channel_*.txt ./plot/ue{kk}_{ktap}/ 2>/dev/null")
++
++            # UE-side per-rx DL channel power ("DLCH <ssb> <nrx> <p0..pN> dB"), one file
++            # per UE -- the direct read on whether the 4x4 DL replay reached the receiver.
++            os.system(f"cp ../../../logs/dl_channel_ue*.txt ./plot/ue{kk}_{ktap}/ 2>/dev/null")
++            os.system(f"cp ../../../logs/dl_csi_ue*.txt ./plot/ue{kk}_{ktap}/ 2>/dev/null")
++
++            # ---- array-level validation of the replayed channel ----
++            # Power-vs-TTI cannot see a replicated-SISO twin, a transposed tx-major
++            # reshape, or dropped per-element phases. The phase-ramp/AoA figure can.
++            here = os.path.dirname(os.path.abspath(__file__))
++            traj = os.environ.get("TT_TRAJ_CSV", "")
++            cmd = (f"python3 {here}/validate_array.py --stem {CHAN_STEM} --taps {ktap} "
++                   f"--out ./plot/ue{kk}_{ktap}/array_validation.png")
++            if traj:
++                cmd += f" --traj {traj}"
++            print(f"[validate] {cmd}", flush=True)
++            os.system(cmd)
++
++            os.system(f"python3 {here}/plot_channel_validation.py --stem {CHAN_STEM} "
++                      f"--taps {ktap} --out ./plot/ue{kk}_{ktap}/channel_validation.png")
++
++            # ---- twin-vs-source comparison, straight from this run's capture ----
++            # Runs here so the figures always reflect the run that just finished,
++            # instead of waiting for someone to invoke the scripts by hand.
++            outdir = f"./plot/ue{kk}_{ktap}"
++            if os.path.exists(f"{outdir}/dl_csi_ue1.txt"):
++                os.system(f"python3 {here}/csi_to_npy.py {outdir}/dl_csi_ue1.txt "
++                          f"-o {outdir}/twin_measured.npy --taps 64")
++                os.system(f"python3 {here}/export_aligned.py --npy {outdir}/twin_measured.npy "
++                          f"--stem {CHAN_STEM} --outdir {outdir}")
++                os.system(f"python3 {here}/plot_phase_amp.py --data {outdir}/aligned_H.txt "
++                          f"--out {outdir}/phase_amplitude.png --csv {outdir}/phase_amp_series.txt")
++                os.system(f"python3 {here}/align_twin.py --npy {outdir}/twin_measured.npy "
++                          f"--stem {CHAN_STEM}")
++                os.system(f"python3 {here}/plot_channel_freq.py --dir {outdir} "
++                          f"--stem {CHAN_STEM}")
++
++            else:
++                print("[compare] no dl_csi_ue1.txt collected -- skipping twin comparison",
++                      flush=True)
++
++            # ---- uplink counterpart, 4x4 from the gNB's SRS channel matrix ----
++            os.system(f"cp ../../../logs/ul_srs_gnb.txt {outdir}/ 2>/dev/null")
++            if os.path.exists(f"{outdir}/ul_srs_gnb.txt") and os.path.getsize(f"{outdir}/ul_srs_gnb.txt") > 0:
++                os.system(f"python3 {here}/plot_phase_amp_ul.py --dir {outdir} --stem {CHAN_STEM}")
++                os.system(f"python3 {here}/plot_channel_freq.py --dir {outdir} --ul "
++                          f"--stem {CHAN_STEM}")
++            else:
++                print("[compare-ul] no SRS records -- check the gNB log for TT-SRS", flush=True)
+             # os.system(f"cp plotting.png ./plot/ue{kk}_{ktap}/plotting.png")
+ 
+ if __name__ == "__main__":
+diff --git a/targets/PROJECTS/GENERIC-NR-5GC/CONF/gnb.sa.band78.fr1.106PRB.usrpb210.conf b/targets/PROJECTS/GENERIC-NR-5GC/CONF/gnb.sa.band78.fr1.106PRB.usrpb210.conf
+index e537cef..4c03fcb 100644
+--- a/targets/PROJECTS/GENERIC-NR-5GC/CONF/gnb.sa.band78.fr1.106PRB.usrpb210.conf
++++ b/targets/PROJECTS/GENERIC-NR-5GC/CONF/gnb.sa.band78.fr1.106PRB.usrpb210.conf
+@@ -24,7 +24,7 @@ gNBs =
+     ////////// Physical parameters:
+ 
+     // MIMO / CSI: >1 antenna port is REQUIRED for cri-RI-PMI-CQI reporting (else CQI stays 0).
+-    // 4x4: XP=2 * N1=2 = 4 DL antenna ports. maxMIMO_layers=2 (OAI's cap even at 4x4).
++    // Scenario is a 1x4 ULA on EACH node -> 4x4 MIMO. XP=2 * N1=2 = 4 DL antenna ports.
+     pdsch_AntennaPorts_XP = 2;
+     pdsch_AntennaPorts_N1 = 2;
+     maxMIMO_layers        = 2;
+@@ -32,6 +32,12 @@ gNBs =
+     do_CSIRS = 1;
+     do_SRS   = 1;
+ 
++    // The replayed channel is unrealistically clean (pathloss 0 dB, noise -20 dB),
++    // so CQI pins at 15 and the scheduler picks MCS table 1 (256QAM). The UE then
++    // segfaults in nr_256qam_llr during PDSCH demodulation -- reproduced twice,
++    // cores logs/core.Tpool*. Forcing table 0 (64QAM) keeps the UE alive.
++    force_256qam_off = 1;
++
+     min_rxtxtime = 6;
+ 
+     servingCellConfigCommon = (
+@@ -270,7 +276,7 @@ channelmod = {
+       model_name     = "rfsimu_channel_ue0"  
+       type           = "AWGN";  
+       ploss_dB       = 0;  
+-      noise_power_dB = 0;  
++      noise_power_dB = -10;  
+       forgetfact     = 0;  
+       offset         = 0;  
+       ds_tdl         = 0;  

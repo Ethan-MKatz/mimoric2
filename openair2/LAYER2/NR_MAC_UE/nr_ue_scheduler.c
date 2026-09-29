@@ -1334,6 +1334,14 @@ void nr_ue_dl_scheduler(NR_UE_MAC_INST_t *mac, nr_downlink_indication_t *dl_info
   if (mac->state == UE_NOT_SYNC || mac->state == UE_DETACHING)
     return;
 
+  {   // ---- TT diagnostic: does the UE leave UE_CONNECTED mid-run? ----
+    static int tt_last_state = -1;
+    if (mac->state != tt_last_state) {
+      LOG_I(NR_MAC, "TT-UE-STATE: %d -> %d at frame %d slot %d\n",
+            tt_last_state, mac->state, rx_frame, rx_slot);
+      tt_last_state = mac->state;
+    }
+  }
   if (mac->state == UE_CONNECTED) {
     nr_schedule_csirs_reception(mac, rx_frame, rx_slot);
     nr_schedule_csi_for_im(mac, rx_frame, rx_slot);
@@ -2730,13 +2738,23 @@ void configure_csi_resource_mapping(fapi_nr_dl_config_csirs_pdu_rel15_t *csirs_c
 
 void nr_schedule_csirs_reception(NR_UE_MAC_INST_t *mac, int frame, int slot)
 {
-  if (!mac->sc_info.csi_MeasConfig)
+  // ---- TT diagnostic: count why CSI-RS reception stops being scheduled ----
+  static unsigned long tt_call = 0, tt_no_cfg = 0, tt_no_list = 0, tt_no_bwp = 0, tt_sched = 0;
+  if ((tt_call++ % 20000) == 0)
+    LOG_I(NR_MAC, "TT-CSIRS-SCHED: calls %lu  scheduled %lu  | no_measconfig %lu  no_list %lu  bwp_mismatch %lu  (frame %d)\n",
+          tt_call, tt_sched, tt_no_cfg, tt_no_list, tt_no_bwp, frame);
+
+  if (!mac->sc_info.csi_MeasConfig) {
+    tt_no_cfg++;
     return;
+  }
 
   NR_CSI_MeasConfig_t *csi_measconfig = mac->sc_info.csi_MeasConfig;
 
-  if (csi_measconfig->nzp_CSI_RS_ResourceToAddModList == NULL)
+  if (csi_measconfig->nzp_CSI_RS_ResourceToAddModList == NULL) {
+    tt_no_list++;
     return;
+  }
 
   fapi_nr_dl_config_request_t *dl_config = get_dl_config_request(mac, slot);
   NR_UE_DL_BWP_t *current_DL_BWP = mac->current_DL_BWP;
@@ -2754,8 +2772,11 @@ void nr_schedule_csirs_reception(NR_UE_MAC_INST_t *mac, int frame, int slot)
       continue;
     NR_CSI_ResourceConfigId_t csi_res_id = find_CSI_resourceconfig(csi_measconfig, dl_bwp_id, nzpcsi->nzp_CSI_RS_ResourceId);
     // do not schedule reseption of this CSI-RS if not associated with current BWP
-    if(csi_res_id < 0)
+    if(csi_res_id < 0) {
+      tt_no_bwp++;
       continue;
+    }
+    tt_sched++;
     LOG_D(MAC,"Scheduling reception of CSI-RS in frame %d slot %d\n", frame, slot);
     fapi_nr_dl_config_csirs_pdu_rel15_t *csirs_config_pdu = &dl_config->dl_config_list[dl_config->number_pdus].csirs_config_pdu.csirs_config_rel15;
     csirs_config_pdu->measurement_bitmap = set_csirs_measurement_bitmap(csi_measconfig, csi_res_id);

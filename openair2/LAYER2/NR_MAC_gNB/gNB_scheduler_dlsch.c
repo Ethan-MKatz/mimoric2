@@ -1099,6 +1099,16 @@ static void pf_dl(module_id_t module_id,
         sched_pdsch->mcs = get_mcs_from_bler_new(UE->rnti,bo, stats, &sched_ctrl->dl_bler_stats, max_mcs, frame);
         //sched_pdsch->mcs = get_mcs_from_bler(bo, stats, &sched_ctrl->dl_bler_stats, max_mcs, frame);
       sched_pdsch->nrOfLayers = get_dl_nrOfLayers(sched_ctrl, current_BWP->dci_format);
+      // DL rank + DL CQI to snr.txt, same "TTI Index / <NAME>: <val> RNTI: <rnti>" shape the
+      // experiment scripts already parse. nrOfLayers is the UE-reported RI + 1, so this is the
+      // observable that tracks a replayed DL MIMO channel.
+      if (fpsnr) {
+        fprintf(fpsnr, "TTI Index: %d\n", tti_counter);
+        fprintf(fpsnr, "DL RANK: %d RNTI: %04x\n", sched_pdsch->nrOfLayers, UE->rnti);
+        fprintf(fpsnr, "TTI Index: %d\n", tti_counter);
+        fprintf(fpsnr, "DL CQI: %d RNTI: %04x\n",
+                sched_ctrl->CSI_report.cri_ri_li_pmi_cqi_report.wb_cqi_1tb, UE->rnti);
+      }
       sched_pdsch->pm_index =
           get_pm_index(mac, UE, current_BWP->dci_format, sched_pdsch->nrOfLayers, mac->radio_config.pdsch_AntennaPorts.XP);
       const uint8_t Qm = nr_get_Qm_dl(sched_pdsch->mcs, current_BWP->mcsTableIdx);

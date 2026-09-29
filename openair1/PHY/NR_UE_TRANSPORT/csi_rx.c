@@ -38,6 +38,28 @@
 #include "PHY/phy_extern_nr_ue.h"
 #include "PHY/NR_REFSIG/nr_refsig.h"
 #include "common/utils/nr/nr_common.h"
+#include <zmq.h>
+
+// ---- TinyTwin: complex 4x4 DL CSI-RS channel dump -------------------------
+// Opened in nr-uesoftmodem.c from TT_DL_CSI_LOG. Power alone cannot reproduce
+// the generator's phase-ramp / AoA / singular-value metrics, so dump the full
+// complex [rx][tx][subcarrier] estimate and let the host side IFFT it to taps.
+FILE *fpdlcsi = NULL;
+int tt_csi_every = 1;    // keep every Nth CSI-RS occasion (TT_DL_CSI_EVERY)
+int tt_csi_max = 2000;   // stop after this many records (TT_DL_CSI_MAX)
+static int tt_csi_seen = 0, tt_csi_written = 0;
+
+// ---- TinyTwin: publish the same DL estimate to a RIC over ZMQ ----------------
+// The gNB's MIMO-RIC export carries the UPLINK (PUSCH DMRS). The replayed 4x4
+// channel lives on the DOWNLINK, at the UE, so a downlink xApp has to be fed
+// from here. PUB never blocks -- it drops when nobody is subscribed, which is
+// what we want on the PHY thread.
+void *tt_csi_zmq_ctx = NULL;
+void *tt_csi_zmq_pub = NULL;
+static unsigned int tt_csi_seq = 0;
+
+#define TT_CSI_MAGIC 0x54544358u   /* "TTCX" */
+#define TT_CSI_MAXF  (8 * 8 * 256 * 2)
 #include "PHY/NR_UE_ESTIMATION/filt16a_32.h"
 
 // Additional memory allocation, because of applying the filter and the memory offset to ensure memory alignment
@@ -983,6 +1005,90 @@ void nr_ue_csi_rs_procedures(PHY_VARS_NR_UE *ue,
                                  &log2_re,
                                  &log2_maxh,
                                  &noise_power);
+
+  // ---- TinyTwin: dump the complex 4x4 CSI-RS channel ----------------------
+  // One record per kept CSI-RS occasion. Subcarrier stepping mirrors the RI/PMI
+  // loops exactly (same rb walk, same freq_density skip, same k_offset), so the
+  // sample grid matches what the receiver itself uses.
+  // ---- TT diagnostic: entry counter, logged unconditionally every 50 occasions ----
+  {
+    static unsigned long tt_entries = 0;
+    if ((tt_entries++ % 50) == 0)
+      LOG_I(NR_PHY, "TT-CSI: entry %lu  frame %d slot %d  bitmap %d  written %d\n",
+            tt_entries, proc->frame_rx, proc->nr_slot_rx,
+            csirs_config_pdu->measurement_bitmap, tt_csi_written);
+  }
+
+  if (fpdlcsi && csirs_config_pdu->measurement_bitmap > 1
+      && (tt_csi_seen++ % tt_csi_every) == 0 && tt_csi_written < tt_csi_max) {
+    const int nrx = frame_parms->nb_antennas_rx;
+    const int ntx = mapping_parms.ports;
+    int nsc = 0;
+    for (int rb = csirs_config_pdu->start_rb;
+         rb < (csirs_config_pdu->start_rb + csirs_config_pdu->nr_of_rbs); rb++) {
+      if (csirs_config_pdu->freq_density <= 1 && csirs_config_pdu->freq_density != (rb % 2))
+        continue;
+      nsc++;
+    }
+    fprintf(fpdlcsi, "CSI %d %d %d %d %d %d", tt_csi_written, proc->frame_rx, proc->nr_slot_rx, nrx, ntx, nsc);
+    for (int ant_rx = 0; ant_rx < nrx; ant_rx++) {
+      for (int port_tx = 0; port_tx < ntx; port_tx++) {
+        for (int rb = csirs_config_pdu->start_rb;
+             rb < (csirs_config_pdu->start_rb + csirs_config_pdu->nr_of_rbs); rb++) {
+          if (csirs_config_pdu->freq_density <= 1 && csirs_config_pdu->freq_density != (rb % 2))
+            continue;
+          uint16_t k = (frame_parms->first_carrier_offset + rb * NR_NB_SC_PER_RB) % frame_parms->ofdm_symbol_size;
+          const c16_t *h = (const c16_t *)&csi_rs_estimated_channel_freq[ant_rx][port_tx][k + mem_offset];
+          fprintf(fpdlcsi, " %d %d", h->r, h->i);
+        }
+      }
+    }
+    fprintf(fpdlcsi, "\n");
+    fflush(fpdlcsi);   // records are ~16 kB; without this a kill loses the tail
+    tt_csi_written++;
+    if (tt_csi_written == tt_csi_max)
+      LOG_I(NR_PHY, "TT CSI dump: reached TT_DL_CSI_MAX=%d records, stopping\n", tt_csi_max);
+  }
+
+  // ---- TinyTwin: same estimate, published to a downlink xApp -----------------
+  // Header is 7 uint32 (magic, seq, frame, slot, nrx, ntx, nsc) followed by
+  // nrx*ntx*nsc*2 float32 ordered [rx][tx][sc] as (re, im) -- the same walk as
+  // the file dump above, so both views agree sample for sample.
+  if (tt_csi_zmq_pub && csirs_config_pdu->measurement_bitmap > 1) {
+    const int nrx = frame_parms->nb_antennas_rx;
+    const int ntx = mapping_parms.ports;
+    int nsc = 0;
+    for (int rb = csirs_config_pdu->start_rb;
+         rb < (csirs_config_pdu->start_rb + csirs_config_pdu->nr_of_rbs); rb++) {
+      if (csirs_config_pdu->freq_density <= 1 && csirs_config_pdu->freq_density != (rb % 2))
+        continue;
+      nsc++;
+    }
+    const int nfloat = nrx * ntx * nsc * 2;
+    if (nfloat > 0 && nfloat <= TT_CSI_MAXF) {
+      static uint32_t hdr[7];
+      static float payload[TT_CSI_MAXF];
+      hdr[0] = TT_CSI_MAGIC; hdr[1] = tt_csi_seq++;
+      hdr[2] = (uint32_t)proc->frame_rx; hdr[3] = (uint32_t)proc->nr_slot_rx;
+      hdr[4] = (uint32_t)nrx; hdr[5] = (uint32_t)ntx; hdr[6] = (uint32_t)nsc;
+      int i = 0;
+      for (int ant_rx = 0; ant_rx < nrx; ant_rx++) {
+        for (int port_tx = 0; port_tx < ntx; port_tx++) {
+          for (int rb = csirs_config_pdu->start_rb;
+               rb < (csirs_config_pdu->start_rb + csirs_config_pdu->nr_of_rbs); rb++) {
+            if (csirs_config_pdu->freq_density <= 1 && csirs_config_pdu->freq_density != (rb % 2))
+              continue;
+            uint16_t k = (frame_parms->first_carrier_offset + rb * NR_NB_SC_PER_RB) % frame_parms->ofdm_symbol_size;
+            const c16_t *h = (const c16_t *)&csi_rs_estimated_channel_freq[ant_rx][port_tx][k + mem_offset];
+            payload[i++] = (float)h->r;
+            payload[i++] = (float)h->i;
+          }
+        }
+      }
+      zmq_send(tt_csi_zmq_pub, hdr, sizeof(hdr), ZMQ_SNDMORE | ZMQ_DONTWAIT);
+      zmq_send(tt_csi_zmq_pub, payload, nfloat * sizeof(float), ZMQ_DONTWAIT);
+    }
+  }
 
   uint8_t rank_indicator = 0;
   // bit 1 in bitmap to indicate RI measurment

@@ -43,3 +43,7 @@ sims/siso/tti_experiments/plot*/
 logs/
 logs_gnb/
 logs_ue/
+
+# Archived run data (self-describing, with SHA256SUMS; kept outside git)
+sims/siso/tti_experiments/datasets/
+sims/siso/tti_experiments/edgeric-v2/results/*.txt

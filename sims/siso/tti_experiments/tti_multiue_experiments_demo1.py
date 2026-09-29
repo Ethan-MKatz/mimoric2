@@ -1,5 +1,6 @@
 import sys
 import os
+import glob
 import time
 import threading
 import numpy as np
@@ -13,7 +14,11 @@ end_ue = int(sys.argv[1])
 start_tap = int(sys.argv[2])
 end_tap = int(sys.argv[2])
 
-start='''
+# Tap file replayed on the DL, as a stem under channel/ (minus _real.txt / _imag.txt).
+# argv[3] overrides it. The tap count (argv[2]) must match the file's taps-per-tx.
+CHAN_STEM = sys.argv[3] if len(sys.argv) > 3 else "signal_concrete_4x4_blocker"
+
+start=f'''
 services:
     tt-gnb:
         image: tt-gnb:v2
@@ -39,9 +44,20 @@ services:
         #     /bin/bash -c "pwd && cd tt/cmake_targets/ran_build/build/ &&
         #     ./nr-softmodem -O ../../../targets/PROJECTS/GENERIC-NR-5GC/CONF/gnb.sa.band78.fr1.106PRB.usrpb210.conf --rfsim -E --sa  -TP 10 --TTI 1 --SNR 1
         #     exec /bin/bash"
+        environment:
+            # UL tap set replayed on the gNB rx path when --ULCHAN 1 is passed below.
+            # Without this the gNB falls back to "signal_metal", which is a SISO-era
+            # file (64 cols x 800 lines) and the wrong shape for a 4x4 replay.
+            - TT_UL_CHAN_SIGNAL={CHAN_STEM}
+            # 4x4 uplink channel from SRS (DMRS is per-layer, so only 4x1 at rank 1).
+            - TT_UL_SRS_LOG=/opt/tt-ran/tt/logs/ul_srs_gnb.txt
+            # SRS period is n_slots_period * MAX_MOBILES_PER_GNB(16) -- roughly the
+            # CSI-RS cadence, NOT every few slots. Keep every report.
+            - TT_UL_SRS_EVERY=1
+            - TT_UL_SRS_MAX=2000
         entrypoint: >    
             /bin/bash -c "cd /opt/tt-ran/tt/cmake_targets/ran_build/build/ &&    
-            ./nr-softmodem -O /opt/tt-ran/etc/gnb.conf --rfsim -E --sa --SNR 1 --MCS 1 --CQI 1 --TPT 1 &&
+            ./nr-softmodem -O /opt/tt-ran/etc/gnb.conf --rfsim -E --sa --SNR 1 --MCS 1 --CQI 1 --TPT 1 --rfsimulator.options chanmod --TAP {start_tap} --ULCHAN 1 &&
             exec /bin/bash"
         stdin_open: true  # docker run -i
         tty: true        # docker run -t
@@ -71,6 +87,16 @@ end='''
             /bin/bash -c "cd /home/EdgeRIC &&  
             python3 ./muApp3/muApp3_monitor_grafana.py &&  
             exec /bin/bash"
+        environment:
+            # MIMO-RIC channel dump: muApp3 appends every ZMQ report to
+            # edgeric-v2/results/ul_channel_power_<stamp>.txt on the host.
+            # TT_CHAN_LOG=0 disables, TT_CHAN_LOG_RAW=1 also dumps the complex samples,
+            # TT_CHAN_LOG_EVERY=N keeps every Nth report.
+            - TT_CHAN_LOG=${TT_CHAN_LOG:-1}
+            # Raw complex UL samples. Needed for any phase metric -- the power
+            # dump alone cannot show a phase ramp or a covariance eigenvector.
+            - TT_CHAN_LOG_RAW=${TT_CHAN_LOG_RAW:-0}
+            - TT_CHAN_LOG_EVERY=${TT_CHAN_LOG_EVERY:-1}
         # privileged mode is requred only for accessing usb devices
         privileged: true
         ports:
@@ -286,9 +312,23 @@ def create_docker(i, n_tap):
             # - ../../../channel/channel.txt:/opt/tt-ran/channel/channel_gradual.txt
             - ../../../ci-scripts/conf_files/nrue.uicc.conf:/opt/oai-nr-ue/etc/nr-ue.conf
             - ../../../logs_ue:/opt/oai-nr-ue/etc/logs
+        environment:
+            # DL tap set replayed on the UE rx path; CHAN_STEM selects the file under channel/
+            - TT_CHAN_SIGNAL={CHAN_STEM}
+            # Per-UE DL channel log. All UEs share the repo bind mount, so the default
+            # logs/dl_channel.txt would have every UE clobbering the same file.
+            - TT_DL_CHAN_LOG=/opt/tt-ran/tt/logs/dl_channel_ue{i-160}.txt
+            # Complex 4x4 CSI-RS dump -- the only capture that can reproduce the
+            # generator's phase-ramp / AoA / singular-value metrics end to end.
+            - TT_DL_CSI_LOG=/opt/tt-ran/tt/logs/dl_csi_ue{i-160}.txt
+            - TT_DL_CSI_EVERY=${{TT_DL_CSI_EVERY:-1}}
+            - TT_DL_CSI_MAX=${{TT_DL_CSI_MAX:-2000}}
+            # Downlink CSI over ZMQ, so an xApp can see the REPLAYED channel.
+            # The gNB's MIMO-RIC export is uplink-only. Port 5558 per UE.
+            - TT_DL_CSI_ZMQ=tcp://0.0.0.0:{5558 + i - 161}
         entrypoint: >
             /bin/bash -c "ls && cd tt/cmake_targets/ran_build/build/ &&
-            ./nr-uesoftmodem --uicc0.imsi 2089901000011{i-150} -C 3619200000 -r 106 --numerology 1 --ssb 516 -E --sa --rfsim -O ../../../ci-scripts/conf_files/nrue.uicc.conf --ue-nb-ant-rx 4 --ue-nb-ant-tx 4 --rfsimulator.serveraddr 192.168.70.140 &&
+            ./nr-uesoftmodem --uicc0.imsi 2089901000011{i-150} -C 3619200000 -r 106 --numerology 1 --ssb 516 -E --sa --rfsim -O ../../../ci-scripts/conf_files/nrue.uicc.conf --ue-nb-ant-rx 4 --ue-nb-ant-tx 4 --uecap_file ../../../targets/PROJECTS/GENERIC-NR-5GC/CONF/uecap_ports4.xml --rfsimulator.options chanmod --TAP {n_tap} --rfsimulator.serveraddr 192.168.70.140 &&
             exec /bin/bash"
         # entrypoint: /bin/bash
         stdin_open: true  
@@ -367,7 +407,9 @@ def autoUE():
             time.sleep(5)
             os.system(f"""top -bn6 > ./plot/ue{kk}_{ktap}/iperf_cpumem.txt """)
             #test
-            time.sleep(1800)  # main run duration: 30 min
+            # Main run duration. TT_RUN_SECONDS shortens it for smoke tests;
+            # the default keeps the original 30-minute window.
+            time.sleep(int(os.environ.get("TT_RUN_SECONDS", "1800")))
             print("kill gnb")
             os.system(f"docker exec tt-gnb chmod +x stop.sh ")
             os.system(f"docker exec -d tt-gnb ./stop.sh ")
@@ -636,6 +678,58 @@ def processDATA():
             
             os.system(f"cp ../../../logs/tti.txt ./plot/ue{kk}_{ktap}/tti.txt")
             os.system(f"cp ../../../logs/snr.txt ./plot/ue{kk}_{ktap}/snr.txt")
+
+            # MIMO-RIC channel dumps written by muApp3 through the edgeric-v2 bind mount
+            os.system(f"cp ./edgeric-v2/results/ul_channel_*.txt ./plot/ue{kk}_{ktap}/ 2>/dev/null")
+
+            # UE-side per-rx DL channel power ("DLCH <ssb> <nrx> <p0..pN> dB"), one file
+            # per UE -- the direct read on whether the 4x4 DL replay reached the receiver.
+            os.system(f"cp ../../../logs/dl_channel_ue*.txt ./plot/ue{kk}_{ktap}/ 2>/dev/null")
+            os.system(f"cp ../../../logs/dl_csi_ue*.txt ./plot/ue{kk}_{ktap}/ 2>/dev/null")
+
+            # ---- array-level validation of the replayed channel ----
+            # Power-vs-TTI cannot see a replicated-SISO twin, a transposed tx-major
+            # reshape, or dropped per-element phases. The phase-ramp/AoA figure can.
+            here = os.path.dirname(os.path.abspath(__file__))
+            traj = os.environ.get("TT_TRAJ_CSV", "")
+            cmd = (f"python3 {here}/validate_array.py --stem {CHAN_STEM} --taps {ktap} "
+                   f"--out ./plot/ue{kk}_{ktap}/array_validation.png")
+            if traj:
+                cmd += f" --traj {traj}"
+            print(f"[validate] {cmd}", flush=True)
+            os.system(cmd)
+
+            os.system(f"python3 {here}/plot_channel_validation.py --stem {CHAN_STEM} "
+                      f"--taps {ktap} --out ./plot/ue{kk}_{ktap}/channel_validation.png")
+
+            # ---- twin-vs-source comparison, straight from this run's capture ----
+            # Runs here so the figures always reflect the run that just finished,
+            # instead of waiting for someone to invoke the scripts by hand.
+            outdir = f"./plot/ue{kk}_{ktap}"
+            if os.path.exists(f"{outdir}/dl_csi_ue1.txt"):
+                os.system(f"python3 {here}/csi_to_npy.py {outdir}/dl_csi_ue1.txt "
+                          f"-o {outdir}/twin_measured.npy --taps 64")
+                os.system(f"python3 {here}/export_aligned.py --npy {outdir}/twin_measured.npy "
+                          f"--stem {CHAN_STEM} --outdir {outdir}")
+                os.system(f"python3 {here}/plot_phase_amp.py --data {outdir}/aligned_H.txt "
+                          f"--out {outdir}/phase_amplitude.png --csv {outdir}/phase_amp_series.txt")
+                os.system(f"python3 {here}/align_twin.py --npy {outdir}/twin_measured.npy "
+                          f"--stem {CHAN_STEM}")
+                os.system(f"python3 {here}/plot_channel_freq.py --dir {outdir} "
+                          f"--stem {CHAN_STEM}")
+
+            else:
+                print("[compare] no dl_csi_ue1.txt collected -- skipping twin comparison",
+                      flush=True)
+
+            # ---- uplink counterpart, 4x4 from the gNB's SRS channel matrix ----
+            os.system(f"cp ../../../logs/ul_srs_gnb.txt {outdir}/ 2>/dev/null")
+            if os.path.exists(f"{outdir}/ul_srs_gnb.txt") and os.path.getsize(f"{outdir}/ul_srs_gnb.txt") > 0:
+                os.system(f"python3 {here}/plot_phase_amp_ul.py --dir {outdir} --stem {CHAN_STEM}")
+                os.system(f"python3 {here}/plot_channel_freq.py --dir {outdir} --ul "
+                          f"--stem {CHAN_STEM}")
+            else:
+                print("[compare-ul] no SRS records -- check the gNB log for TT-SRS", flush=True)
             # os.system(f"cp plotting.png ./plot/ue{kk}_{ktap}/plotting.png")
 
 if __name__ == "__main__":

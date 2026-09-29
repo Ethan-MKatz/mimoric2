@@ -120,6 +120,7 @@ typedef enum { SIMU_ROLE_SERVER = 1, SIMU_ROLE_CLIENT } simuRole;
 extern FILE *fplog3;
 extern int first_time;
 extern int gnb1_ue0;
+extern int ul_chan_enable;
 extern int taplen;
 
 static void getset_currentchannels_type(char *buf, int debug, webdatadef_t *tdata, telnet_printfunc_t prnt);
@@ -1024,7 +1025,10 @@ static int rfsimulator_read(openair0_device *device, openair0_timestamp *ptimest
       // // MIMO should be handled here // //
       for (int a=0; a<nbAnt; a++) {//loop over number of Rx antennas
 
-        if ( ptr->channel_model != NULL && gnb1_ue0==0 && taplen>0) { // apply a channel model
+        // The UE replays on its rx path (DL). With --ULCHAN 1 the gNB does the same on its
+        // rx path, so the UL carries the replayed MIMO H instead of rfsim's H_awgn_mimo
+        // placeholder below -- that is what makes the UL channel visible to the MIMO-RIC export.
+        if ( ptr->channel_model != NULL && (gnb1_ue0==0 || ul_chan_enable) && taplen>0) { // apply a channel model
           // log time
           struct timespec start; // Structs to store time
           clock_gettime(CLOCK_REALTIME, &start);
@@ -1038,7 +1042,8 @@ static int rfsimulator_read(openair0_device *device, openair0_timestamp *ptimest
                      nsamps,
                      t->nextRxTstamp,
                      CirSize,
-                     sock);
+                     sock,
+                     ptr->th.nbAnt);
         }
         else { // no channel modeling
           int nbAnt_tx = ptr->th.nbAnt; // number of Tx antennas

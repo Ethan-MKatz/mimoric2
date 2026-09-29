@@ -61,6 +61,12 @@ int taplen;
 int jam_enable = 0;      // --JAM  <0/1>   : turn the jammer on/off
 double jam_gain = 1.0;   // --JGAIN <float>: linear gain applied to the jammer output
 int jamtaplen = 64;      // --JTAP <n>     : number of jammer taps per TTI
+// --- uplink channel replay ---
+// The UE always replays the channel on its receive path (DL). The gNB normally applies
+// nothing and rfsim falls back to its hardcoded H_awgn_mimo placeholder, so the UL carries
+// no replayed channel at all. --ULCHAN 1 lets the gNB run the same MIMO replay on its
+// receive path, which is what makes the UL H visible to the MIMO-RIC channel export.
+int ul_chan_enable = 0;  // --ULCHAN <0/1>
 int snrlog = 0;
 int cqilog = 0;
 int tptlog = 0;
@@ -266,6 +272,7 @@ configmodule_interface_t *load_configmodule(int argc,
   int JAMIdx=-1;
   int JGAINIdx=-1;
   int JTAPIdx=-1;
+  int ULCHANIdx=-1;
   int OWoptIdx = -1;
 
   printf("CMDLINE: ");
@@ -311,6 +318,11 @@ configmodule_interface_t *load_configmodule(int argc,
     if (JTAPopt == argv[i] + 2) {
       jamtaplen = argv[i + 1] ? atoi(argv[i + 1]) : 64;
       JTAPIdx = i;
+    }
+    char *ULCHANopt = strstr(argv[i], "ULCHAN");
+    if (ULCHANopt == argv[i] + 2) {
+      ul_chan_enable = argv[i + 1] ? atoi(argv[i + 1]) : 0;
+      ULCHANIdx = i;
     }
 
     // if (strcmp(&argv[i][1], "SNR") == 0 && i < (argc - 1)) {
@@ -486,6 +498,10 @@ configmodule_interface_t *load_configmodule(int argc,
     if (JTAPIdx >= 0) {
       cfgptr->argv_info[JTAPIdx] |= CONFIG_CMDLINEOPT_PROCESSED;
       cfgptr->argv_info[JTAPIdx+1] |= CONFIG_CMDLINEOPT_PROCESSED;
+    }
+    if (ULCHANIdx >= 0) {
+      cfgptr->argv_info[ULCHANIdx] |= CONFIG_CMDLINEOPT_PROCESSED;
+      cfgptr->argv_info[ULCHANIdx+1] |= CONFIG_CMDLINEOPT_PROCESSED;
     }
 
     cfgptr->rtflags = cfgptr->rtflags | tmpflags;

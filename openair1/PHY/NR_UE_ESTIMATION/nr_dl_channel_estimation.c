@@ -34,6 +34,9 @@
 #include <openair1/PHY/TOOLS/phy_scope_interface.h>
 #include "nfapi/open-nFAPI/nfapi/public_inc/nfapi_nr_interface.h"
 
+#include <math.h>
+FILE *fpdlch = NULL;  // TinyTwin: per-rx-antenna DL channel power log (logs/dl_channel.txt)
+
 
 extern openair0_config_t openair0_cfg[];
 
@@ -828,6 +831,24 @@ int nr_pbch_channel_estimation(const NR_DL_FRAME_PARMS *fp,
       LOG_D(PHY,"Channel Impulse Computation Slot %d Symbol %d ch_offset %d\n", Ns, symbol, ch_offset);
       freq2time(fp->ofdm_symbol_size, (int16_t *)&dl_ch_estimates[aarx][ch_offset], (int16_t *)&dl_ch_estimates_time[aarx]);
     }
+  }
+
+  // ---- TinyTwin: per-rx-antenna DL channel power from the SSB estimate ----
+  // Riding on PBCH means this samples every SSB period regardless of user traffic, so a
+  // replayed DL channel is observable without a PDU session. One line per SSB:
+  //   DLCH <ssb_counter> <nb_antennas_rx> <pow_rx0_dB> <pow_rx1_dB> ...
+  if (dmrss == lastsymbol && fpdlch) {
+    static unsigned long ssb_counter = 0;
+    fprintf(fpdlch, "DLCH %lu %d", ssb_counter++, fp->nb_antennas_rx);
+    for (int aarx = 0; aarx < fp->nb_antennas_rx; aarx++) {
+      const c16_t *ch = &dl_ch_estimates[aarx][ch_offset];
+      double e = 0.0;
+      for (int k = 0; k < (int)fp->ofdm_symbol_size; k++)
+        e += (double)ch[k].r * ch[k].r + (double)ch[k].i * ch[k].i;
+      fprintf(fpdlch, " %.4f", e > 0.0 ? 10.0 * log10(e) : -200.0);
+    }
+    fprintf(fpdlch, "\n");
+    fflush(fpdlch);  // SSB-rate, cheap; keeps the log usable while a run is live
   }
 
   return(0);

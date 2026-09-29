@@ -1,0 +1,19 @@
+ CMakeLists.txt                                     |   2 +-
+ ci-scripts/conf_files/nrue.uicc.conf               |   4 +-
+ common/config/config_load_configmodule.c           |  16 ++++
+ executables/nr-softmodem.c                         |  41 +++++++-
+ executables/nr-uesoftmodem.c                       |  93 ++++++++++++++++--
+ openair1/PHY/NR_TRANSPORT/nr_ulsch_demodulation.c  |   6 +-
+ .../NR_UE_ESTIMATION/nr_dl_channel_estimation.c    |  21 ++++
+ openair1/PHY/NR_UE_TRANSPORT/csi_rx.c              | 106 +++++++++++++++++++++
+ openair2/LAYER2/NR_MAC_UE/nr_ue_scheduler.c        |  27 +++++-
+ openair2/LAYER2/NR_MAC_gNB/gNB_scheduler_dlsch.c   |  10 ++
+ openair2/LAYER2/NR_MAC_gNB/gNB_scheduler_ulsch.c   |  48 ++++++++++
+ radio/rfsimulator/apply_channelmod.c               |  74 +++++++++++---
+ radio/rfsimulator/rfsimulator.h                    |   3 +-
+ radio/rfsimulator/simulator.c                      |   9 +-
+ sims/siso/tti_experiments/docker-compose.yaml      |  39 +++++++-
+ .../edgeric-v2/muApp3/muApp3_monitor_grafana.py    |  64 ++++++++++++-
+ .../tti_multiue_experiments_demo1.py               | 102 +++++++++++++++++++-
+ .../CONF/gnb.sa.band78.fr1.106PRB.usrpb210.conf    |  10 +-
+ 18 files changed, 632 insertions(+), 43 deletions(-)

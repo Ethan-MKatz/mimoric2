@@ -2093,7 +2093,7 @@ target_link_libraries(nr-uesoftmodem PRIVATE
   PHY_COMMON PHY_NR_COMMON PHY_NR_UE NR_L2_UE L2_UE_LTE_NR MAC_NR_COMMON NFAPI_LIB NFAPI_PNF_LIB
   NFAPI_USER_LIB MISC_NFAPI_NR_LIB
   ITTI LIB_5GNAS_GNB LIB_NAS_SIMUE ${NAS_SIM_LIB} SIMU shlib_loader
-  -Wl,--end-group z dl)
+  -Wl,--end-group z dl zmq)   # zmq: TinyTwin DL CSI publisher (csi_rx.c)
 
 target_link_libraries(nr-uesoftmodem PRIVATE pthread m CONFIG_LIB rt nr_ue_phy_meas)
 target_link_libraries(nr-uesoftmodem PRIVATE ${T_LIB})

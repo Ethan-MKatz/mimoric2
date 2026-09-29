@@ -27,6 +27,7 @@
 #include <stdbool.h>
 #include <signal.h>
 #include <stdio.h>
+#include <zmq.h>
 
 #include "T.h"
 #include "common/oai_version.h"
@@ -95,6 +96,11 @@ unsigned short config_frames[4] = {2,9,11,13};
 extern FILE *fpr[50];
 extern FILE *fpi[50];
 extern FILE *fprsrp;
+extern FILE *fpdlcsi;   // complex 4x4 CSI-RS dump (csi_rx.c)
+extern void *tt_csi_zmq_ctx;
+extern void *tt_csi_zmq_pub;
+extern int tt_csi_every;
+extern int tt_csi_max;
 extern FILE *fpcqi;
 extern FILE *fplog; 
 extern FILE *fplog2;
@@ -113,6 +119,20 @@ FILE *fpr[50];
 FILE *fpi[50];
 FILE *fpr_jam[50];
 FILE *fpi_jam[50];
+extern FILE *fpdlch;   // per-rx-antenna DL channel power log
+
+/* Open one channel tap file under channel/, by stem and "real"/"imag" part.
+   Returns NULL and logs if it is missing, so a bad path shows up here rather
+   than as a crash in the replay loop. */
+static FILE *openTapFile(const char *stem, const char *part)
+{
+  char path[512];
+  snprintf(path, sizeof(path), "../../../channel/%s_%s.txt", stem, part);
+  FILE *f = fopen(path, "r");
+  if (f == NULL)
+    LOG_E(HW, "channel replay: cannot open %s\n", path);
+  return f;
+}
 FILE *fpcqi;
 FILE *fprsrp;
 FILE *fplog;
@@ -285,17 +305,72 @@ void init_openair0()
   // fpr = fopen("../../../channel/real_random_10tap.txt", "r");
   // fpi = fopen("../../../channel/real_random_10tap.txt", "r");
 
-  fpr[0] = fopen("../../../channel/signal_metal_4x4_real.txt", "r");
-  fpi[0] = fopen("../../../channel/signal_metal_4x4_imag.txt", "r");
+  // Which tap set to replay is chosen at run time so an A/B (e.g. concrete vs
+  // metal) needs no rebuild: set TT_CHAN_SIGNAL / TT_CHAN_JAMMER to the file
+  // stem under channel/, minus the _real.txt / _imag.txt suffix.
+  const char *sigStem = getenv("TT_CHAN_SIGNAL") ? getenv("TT_CHAN_SIGNAL") : "signal_metal_4x4";
+  const char *jamStem = getenv("TT_CHAN_JAMMER") ? getenv("TT_CHAN_JAMMER") : "jammer_metal_4x4";
 
-  fpr[1] = fopen("../../../channel/signal_metal_4x4_real.txt", "r");
-  fpi[1] = fopen("../../../channel/signal_metal_4x4_imag.txt", "r");
+  for (int s = 0; s < 2; s++) {
+    fpr[s] = openTapFile(sigStem, "real");
+    fpi[s] = openTapFile(sigStem, "imag");
+    fpr_jam[s] = openTapFile(jamStem, "real");
+    fpi_jam[s] = openTapFile(jamStem, "imag");
+  }
+  LOG_I(HW, "channel replay: signal='%s' jammer='%s'\n", sigStem, jamStem);
 
-  // jammer channel taps (real + imag) — replayed alongside the signal channel
-  fpr_jam[0] = fopen("../../../channel/jammer_metal_4x4_real.txt", "r");
-  fpi_jam[0] = fopen("../../../channel/jammer_metal_4x4_imag.txt", "r");
-  fpr_jam[1] = fopen("../../../channel/jammer_metal_4x4_real.txt", "r");
-  fpi_jam[1] = fopen("../../../channel/jammer_metal_4x4_imag.txt", "r");
+  // Per-rx-antenna DL channel power, written from the SSB channel estimate.
+  // TT_DL_CHAN_LOG overrides the path; default lands beside the other logs.
+  {
+    const char *dlLog = getenv("TT_DL_CHAN_LOG") ? getenv("TT_DL_CHAN_LOG") : "../../../logs/dl_channel.txt";
+    fpdlch = fopen(dlLog, "w");
+    if (fpdlch == NULL)
+      LOG_E(HW, "DL channel log: cannot open %s\n", dlLog);
+    else
+      LOG_I(HW, "DL channel log: %s\n", dlLog);
+  }
+
+  // Complex 4x4 CSI-RS channel dump, opt-in: TT_DL_CSI_LOG names the file.
+  // This is what the host-side validate_mimo.py needs -- dl_channel.txt carries
+  // power only, which cannot show phase ramp, AoA or singular-value structure.
+  {
+    const char *csiLog = getenv("TT_DL_CSI_LOG");
+    if (csiLog && csiLog[0]) {
+      if (getenv("TT_DL_CSI_EVERY") && atoi(getenv("TT_DL_CSI_EVERY")) > 0)
+        tt_csi_every = atoi(getenv("TT_DL_CSI_EVERY"));
+      if (getenv("TT_DL_CSI_MAX") && atoi(getenv("TT_DL_CSI_MAX")) > 0)
+        tt_csi_max = atoi(getenv("TT_DL_CSI_MAX"));
+      fpdlcsi = fopen(csiLog, "w");
+      if (fpdlcsi == NULL)
+        LOG_E(HW, "DL CSI dump: cannot open %s\n", csiLog);
+      else
+        LOG_I(HW, "DL CSI dump: %s (every %d, max %d)\n", csiLog, tt_csi_every, tt_csi_max);
+    }
+  }
+
+  // Downlink CSI over ZMQ, for an xApp that needs the REPLAYED channel.
+  // The gNB's MIMO-RIC export is uplink-only; this is the downlink equivalent.
+  // TT_DL_CSI_ZMQ is a bind endpoint, e.g. tcp://0.0.0.0:5558
+  {
+    const char *ep = getenv("TT_DL_CSI_ZMQ");
+    if (ep && ep[0]) {
+      tt_csi_zmq_ctx = zmq_ctx_new();
+      tt_csi_zmq_pub = tt_csi_zmq_ctx ? zmq_socket(tt_csi_zmq_ctx, ZMQ_PUB) : NULL;
+      if (tt_csi_zmq_pub) {
+        int sndhwm = 8;   // shallow queue: a slow subscriber must never stall the PHY
+        zmq_setsockopt(tt_csi_zmq_pub, ZMQ_SNDHWM, &sndhwm, sizeof(sndhwm));
+        int linger = 0;
+        zmq_setsockopt(tt_csi_zmq_pub, ZMQ_LINGER, &linger, sizeof(linger));
+        if (zmq_bind(tt_csi_zmq_pub, ep) != 0) {
+          LOG_E(HW, "DL CSI ZMQ: cannot bind %s (%s)\n", ep, zmq_strerror(zmq_errno()));
+          zmq_close(tt_csi_zmq_pub);
+          tt_csi_zmq_pub = NULL;
+        } else {
+          LOG_I(HW, "DL CSI ZMQ: publishing on %s\n", ep);
+        }
+      }
+    }
+  }
 
   // if (snrlog){
     // fpsnr = fopen("../../../logs/snr.txt", "w"); // file the SNR is written to

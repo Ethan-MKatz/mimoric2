@@ -43,13 +43,44 @@ class PrometheusMonitor:
         self.avg_tot_ul_buffer_gauge = Gauge('tot_avg_ul_buffer', 'tot Average UL Buffer', ['non'])
         self.avg_tot_tx_throughput_gauge = Gauge('tot_avg_tx_throughput', 'tot Average TX Throughput', ['non'])
         self.avg_tot_rx_throughput_gauge = Gauge('tot_avg_rx_throughput', 'tot Average RX Throughput', ['non'])
-        
+
+        # MIMO-RIC: per-rx-antenna UL channel power. ul_channel arrives flattened
+        # as nrx x nsc x (re,im); collapsing each antenna to a power in dB gives
+        # one series per rx antenna, which is what shows the 4x4 is really live.
+        self.ul_channel_power_gauge = Gauge('ue_ul_channel_power_db', 'UE per-rx-antenna UL channel power (dB)', ['rnti', 'rx'])
+        self.ul_channel_nrx_gauge = Gauge('ue_ul_channel_nrx', 'UE rx antennas reporting UL channel', ['rnti'])
+
+        # MIMO-RIC: continuous dump of the ZMQ channel reports to disk. Prometheus keeps
+        # only the newest value per series, so anything to be compared offline has to be
+        # appended as it arrives. Written under the ./edgeric-v2 bind mount so the files
+        # land on the host.
+        self.chan_log_dir = os.environ.get("TT_CHAN_LOG_DIR", "/home/EdgeRIC/results")
+        self.chan_log_every = max(1, int(os.environ.get("TT_CHAN_LOG_EVERY", "1")))
+        self.chan_log_raw = os.environ.get("TT_CHAN_LOG_RAW", "0") == "1"
+        self.chan_rx_count = 0
+        self.chan_pow_file = None
+        self.chan_raw_file = None
+        if os.environ.get("TT_CHAN_LOG", "1") != "0":
+            os.makedirs(self.chan_log_dir, exist_ok=True)
+            stamp = os.environ.get("TT_CHAN_LOG_TAG") or time.strftime("%Y%m%d-%H%M%S")
+            pow_path = os.path.join(self.chan_log_dir, f"ul_channel_power_{stamp}.txt")
+            self.chan_pow_file = open(pow_path, "w", buffering=1)
+            self.chan_pow_file.write("wallclock,tti,rnti,nrx,nsc,rx,power_db\n")
+            print(f"[MIMO-RIC] logging per-antenna channel power to {pow_path}", flush=True)
+            if self.chan_log_raw:
+                raw_path = os.path.join(self.chan_log_dir, f"ul_channel_raw_{stamp}.txt")
+                self.chan_raw_file = open(raw_path, "w", buffering=1)
+                # variable-width: header names the fixed prefix, then nrx*nsc*2 floats
+                self.chan_raw_file.write("wallclock,tti,rnti,nrx,nsc,samples[rx][sc][re,im]...\n")
+                print(f"[MIMO-RIC] logging raw channel samples to {raw_path}", flush=True)
+
         start_http_server(self.port)
 
 
     def update_metrics(self):
         while True:
             self.tti_count, self.ue_dict = self.messenger.get_metrics(True)
+            self.chan_rx_count += 1
             #self.tti_count_gauge.set(self.ran_tti)
             avg_tx_throughput_tot=[]
             avg_rx_throughput_tot=[]
@@ -73,6 +104,7 @@ class PrometheusMonitor:
                 self.avg_rx_throughput_gauge.labels(rnti=rnti).set(avg_rx_throughput)
                 self.avg_dl_buffer_gauge.labels(rnti=rnti).set(avg_dl_buffer)
                 self.avg_ul_buffer_gauge.labels(rnti=rnti).set(avg_ul_buffer)
+                self.publish_ul_channel(rnti, metrics)
 
             self.avg_tot_tx_throughput_gauge.labels(non=1).set(sum(avg_tx_throughput_tot))
             self.avg_tot_rx_throughput_gauge.labels(non=1).set(sum(avg_rx_throughput_tot))
@@ -85,6 +117,36 @@ class PrometheusMonitor:
                 # self.dl_tbs_gauge.labels(rnti=rnti).set(metrics['dl_tbs'])
 
             
+
+    def publish_ul_channel(self, rnti, metrics):
+        """Collapse the flattened ul_channel into one power-in-dB series per rx antenna."""
+        chan = metrics.get('ul_channel') or []
+        nrx = metrics.get('ul_channel_nrx') or 0
+        nsc = metrics.get('ul_channel_nsc') or 0
+        if not chan or nrx <= 0 or nsc <= 0:
+            return
+        self.ul_channel_nrx_gauge.labels(rnti=rnti).set(nrx)
+        # expected layout: nrx * nsc * 2 floats (re, im)
+        if len(chan) < nrx * nsc * 2:
+            return
+        arr = np.asarray(chan[:nrx * nsc * 2], dtype=np.float64).reshape(nrx, nsc, 2)
+        power = (arr[:, :, 0] ** 2 + arr[:, :, 1] ** 2).mean(axis=1)
+        db = [10.0 * np.log10(p) if p > 0 else -200.0 for p in power]
+        for rx in range(nrx):
+            self.ul_channel_power_gauge.labels(rnti=rnti, rx=rx).set(db[rx])
+        self.log_ul_channel(rnti, nrx, nsc, db, chan)
+
+    def log_ul_channel(self, rnti, nrx, nsc, db, chan):
+        """Append this report to the txt logs, one row per rx antenna (plus raw if enabled)."""
+        if self.chan_pow_file is None or (self.chan_rx_count % self.chan_log_every):
+            return
+        now = time.time()
+        for rx in range(nrx):
+            self.chan_pow_file.write(
+                f"{now:.6f},{self.tti_count},{rnti},{nrx},{nsc},{rx},{db[rx]:.6f}\n")
+        if self.chan_raw_file is not None:
+            samples = ",".join(f"{v:.6g}" for v in chan[:nrx * nsc * 2])
+            self.chan_raw_file.write(f"{now:.6f},{self.tti_count},{rnti},{nrx},{nsc},{samples}\n")
 
     def calculate_moving_avg(self, rnti, metrics):
       

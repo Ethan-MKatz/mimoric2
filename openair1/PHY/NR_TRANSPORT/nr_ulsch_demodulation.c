@@ -1676,7 +1676,11 @@ int nr_rx_pusch_tp(PHY_VARS_gNB *gNB,
         c16_t *che = (c16_t *)ul_ch_estimates_ext[0 * nrx + aarx];
         int base = meas_symbol * nb_re_pusch;
         int cnt = 0;
-        for (int re = 0; re < buffer_length && (idx + 2) <= (int)(sizeof(chbuf)/sizeof(float)); re += DS_SC) {
+        // Bound by nb_re_pusch, not buffer_length: only nb_re_pusch REs were written for
+        // this symbol (on the DMRS symbol get_nb_re_pusch is half the allocation width), so
+        // walking to buffer_length reads the next symbol's unwritten block as zeros -- and
+        // for a late meas_symbol runs past the end of the row entirely.
+        for (int re = 0; re < nb_re_pusch && (idx + 2) <= (int)(sizeof(chbuf)/sizeof(float)); re += DS_SC) {
           chbuf[idx++] = (float)che[base + re].r;
           chbuf[idx++] = (float)che[base + re].i;
           cnt++;

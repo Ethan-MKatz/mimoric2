@@ -24,9 +24,20 @@ services:
         #     /bin/bash -c "pwd && cd tt/cmake_targets/ran_build/build/ &&
         #     ./nr-softmodem -O ../../../targets/PROJECTS/GENERIC-NR-5GC/CONF/gnb.sa.band78.fr1.106PRB.usrpb210.conf --rfsim -E --sa  -TP 10 --TTI 1 --SNR 1
         #     exec /bin/bash"
+        environment:
+            # UL tap set replayed on the gNB rx path when --ULCHAN 1 is passed below.
+            # Without this the gNB falls back to "signal_metal", which is a SISO-era
+            # file (64 cols x 800 lines) and the wrong shape for a 4x4 replay.
+            - TT_UL_CHAN_SIGNAL=signal_concrete_4x4_blocker
+            # 4x4 uplink channel from SRS (DMRS is per-layer, so only 4x1 at rank 1).
+            - TT_UL_SRS_LOG=/opt/tt-ran/tt/logs/ul_srs_gnb.txt
+            # SRS period is n_slots_period * MAX_MOBILES_PER_GNB(16) -- roughly the
+            # CSI-RS cadence, NOT every few slots. Keep every report.
+            - TT_UL_SRS_EVERY=1
+            - TT_UL_SRS_MAX=2000
         entrypoint: >    
             /bin/bash -c "cd /opt/tt-ran/tt/cmake_targets/ran_build/build/ &&    
-            ./nr-softmodem -O /opt/tt-ran/etc/gnb.conf --rfsim -E --sa --SNR 1 --MCS 1 --CQI 1 --TPT 1 &&
+            ./nr-softmodem -O /opt/tt-ran/etc/gnb.conf --rfsim -E --sa --SNR 1 --MCS 1 --CQI 1 --TPT 1 --rfsimulator.options chanmod --TAP 64 --ULCHAN 1 &&
             exec /bin/bash"
         stdin_open: true  # docker run -i
         tty: true        # docker run -t
@@ -57,9 +68,23 @@ services:
             # - ../../../channel/channel.txt:/opt/tt-ran/channel/channel_gradual.txt
             - ../../../ci-scripts/conf_files/nrue.uicc.conf:/opt/oai-nr-ue/etc/nr-ue.conf
             - ../../../logs_ue:/opt/oai-nr-ue/etc/logs
+        environment:
+            # DL tap set replayed on the UE rx path; CHAN_STEM selects the file under channel/
+            - TT_CHAN_SIGNAL=signal_concrete_4x4_blocker
+            # Per-UE DL channel log. All UEs share the repo bind mount, so the default
+            # logs/dl_channel.txt would have every UE clobbering the same file.
+            - TT_DL_CHAN_LOG=/opt/tt-ran/tt/logs/dl_channel_ue1.txt
+            # Complex 4x4 CSI-RS dump -- the only capture that can reproduce the
+            # generator's phase-ramp / AoA / singular-value metrics end to end.
+            - TT_DL_CSI_LOG=/opt/tt-ran/tt/logs/dl_csi_ue1.txt
+            - TT_DL_CSI_EVERY=${TT_DL_CSI_EVERY:-1}
+            - TT_DL_CSI_MAX=${TT_DL_CSI_MAX:-2000}
+            # Downlink CSI over ZMQ, so an xApp can see the REPLAYED channel.
+            # The gNB's MIMO-RIC export is uplink-only. Port 5558 per UE.
+            - TT_DL_CSI_ZMQ=tcp://0.0.0.0:5558
         entrypoint: >
             /bin/bash -c "ls && cd tt/cmake_targets/ran_build/build/ &&
-            ./nr-uesoftmodem --uicc0.imsi 208990100001111 -C 3619200000 -r 106 --numerology 1 --ssb 516 -E --sa --rfsim -O ../../../ci-scripts/conf_files/nrue.uicc.conf --ue-nb-ant-rx 4 --ue-nb-ant-tx 4 --rfsimulator.serveraddr 192.168.70.140 &&
+            ./nr-uesoftmodem --uicc0.imsi 208990100001111 -C 3619200000 -r 106 --numerology 1 --ssb 516 -E --sa --rfsim -O ../../../ci-scripts/conf_files/nrue.uicc.conf --ue-nb-ant-rx 4 --ue-nb-ant-tx 4 --uecap_file ../../../targets/PROJECTS/GENERIC-NR-5GC/CONF/uecap_ports4.xml --rfsimulator.options chanmod --TAP 64 --rfsimulator.serveraddr 192.168.70.140 &&
             exec /bin/bash"
         # entrypoint: /bin/bash
         stdin_open: true  
@@ -89,6 +114,16 @@ services:
             /bin/bash -c "cd /home/EdgeRIC &&  
             python3 ./muApp3/muApp3_monitor_grafana.py &&  
             exec /bin/bash"
+        environment:
+            # MIMO-RIC channel dump: muApp3 appends every ZMQ report to
+            # edgeric-v2/results/ul_channel_power_<stamp>.txt on the host.
+            # TT_CHAN_LOG=0 disables, TT_CHAN_LOG_RAW=1 also dumps the complex samples,
+            # TT_CHAN_LOG_EVERY=N keeps every Nth report.
+            - TT_CHAN_LOG=${TT_CHAN_LOG:-1}
+            # Raw complex UL samples. Needed for any phase metric -- the power
+            # dump alone cannot show a phase ramp or a covariance eigenvector.
+            - TT_CHAN_LOG_RAW=${TT_CHAN_LOG_RAW:-0}
+            - TT_CHAN_LOG_EVERY=${TT_CHAN_LOG_EVERY:-1}
         # privileged mode is requred only for accessing usb devices
         privileged: true
         ports:

@@ -113,6 +113,9 @@ extern FILE *fpdlmcs;
 extern FILE *fpretx;
 extern const char *channel_file;
 extern int gnb1_ue0;
+extern FILE *fpulsrs;      // 4x4 UL SRS matrix dump (gNB_scheduler_ulsch.c)
+extern int tt_srs_every;
+extern int tt_srs_max;
 
 extern long long unsigned int timing_array[_ARRAY_SIZE];
 extern int timing_array_index;
@@ -664,9 +667,41 @@ int main( int argc, char **argv ) {
   // METAL VERSIONS //
   // fpr = fopen("../../../channel/real_random_10tap.txt", "r");
   // fpi = fopen("../../../channel/real_random_10tap.txt", "r");
-  for (int i=0;i<50;i++){
-    fpr[i] = fopen("../../../channel/signal_metal_real.txt", "r");
-    fpi[i] = fopen("../../../channel/signal_metal_imag.txt", "r");
+  // Tap set for the UL replay (--ULCHAN 1). TT_UL_CHAN_SIGNAL picks the file stem under
+  // channel/ so a material swap needs no rebuild; the default keeps the previous behaviour.
+  // Handle count is unchanged on purpose -- see the fd note below.
+  {
+    const char *ulStem = getenv("TT_UL_CHAN_SIGNAL") ? getenv("TT_UL_CHAN_SIGNAL") : "signal_metal";
+    char pr[512], pi[512];
+    snprintf(pr, sizeof(pr), "../../../channel/%s_real.txt", ulStem);
+    snprintf(pi, sizeof(pi), "../../../channel/%s_imag.txt", ulStem);
+    for (int i = 0; i < 50; i++) {
+      fpr[i] = fopen(pr, "r");
+      fpi[i] = fopen(pi, "r");
+    }
+    // NOTE: plain stderr, not LOG_*: logInit() has not run yet at this point in main().
+    if (fpr[0] == NULL || fpi[0] == NULL)
+      fprintf(stderr, "[UL channel replay] cannot open %s / %s\n", pr, pi);
+    else
+      fprintf(stderr, "[UL channel replay] tap set '%s' (enable with --ULCHAN 1)\n", ulStem);
+  }
+
+  // 4x4 uplink channel from SRS, opt-in via TT_UL_SRS_LOG (a file path).
+  // DMRS cannot give 4x4 at UL rank 1; SRS is sounded per UE antenna port.
+  // NOTE: plain stderr -- logInit() has not run yet at this point in main().
+  {
+    const char *srsLog = getenv("TT_UL_SRS_LOG");
+    if (srsLog && srsLog[0]) {
+      if (getenv("TT_UL_SRS_EVERY") && atoi(getenv("TT_UL_SRS_EVERY")) > 0)
+        tt_srs_every = atoi(getenv("TT_UL_SRS_EVERY"));
+      if (getenv("TT_UL_SRS_MAX") && atoi(getenv("TT_UL_SRS_MAX")) > 0)
+        tt_srs_max = atoi(getenv("TT_UL_SRS_MAX"));
+      fpulsrs = fopen(srsLog, "w");
+      if (fpulsrs == NULL)
+        fprintf(stderr, "[UL SRS dump] cannot open %s\n", srsLog);
+      else
+        fprintf(stderr, "[UL SRS dump] %s (every %d, max %d)\n", srsLog, tt_srs_every, tt_srs_max);
+    }
   }
   // NOTE: the gNB never applies the channel/jammer (gnb1_ue0==1), so we do NOT open
   // jammer files here — 100 extra fds would push the rfsim socket fd past MAX_FD_RFSIMU

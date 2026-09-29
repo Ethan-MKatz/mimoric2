@@ -1,0 +1,8 @@
+global:  
+  scrape_interval: 500ms
+  
+scrape_configs:  
+  - job_name: 'edgeric'  
+    static_configs:  
+      - targets: ['edgeric_v2_2:7000']
+
